@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Text;
+using APSIM.Server.Commands;
 using CommandLine;
 
 namespace APSIM.Cluster
@@ -28,15 +30,24 @@ namespace APSIM.Cluster
         /// <param name="options">Options</param>
         private static void Run(Options options)
         {
+            Bootstrapper bootstrapper = null;
             try
             {
-                Bootstrapper bootstrapper = new Bootstrapper(options);
+                bootstrapper = new Bootstrapper(options);
                 bootstrapper.Run();
+                ICommand command = new RunCommand(new Models.Core.Run.IReplacement[0]);
+                bootstrapper.SendCommand(command);
+
+                // TestCopyFile.TestCompressToProcess();
+
+                // MoreTests.Run();
             }
             catch (Exception err)
             {
                 Console.Error.WriteLine(err);
                 exitCode = 1;
+                if (bootstrapper != null)
+                    bootstrapper.Dispose();
             }
         }
 

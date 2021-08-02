@@ -17,6 +17,10 @@ namespace APSIM.Cluster
         {
         }
 
+        public BootstrapperException(Exception innerException) : base(GetMessage("", innerException), innerException)
+        {
+        }
+
         private static string GetMessage(string message, Exception innerException)
         {
             if (innerException is HttpOperationException httpError)
