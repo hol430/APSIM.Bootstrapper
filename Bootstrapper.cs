@@ -158,6 +158,11 @@ namespace APSIM.Cluster
         private const uint jobManagerPortNo = 27747;
 
         /// <summary>
+        /// Port on which the worker nodes listen for connections.
+        /// </summary>
+        private const uint workerNodePortNo = 27746;
+
+        /// <summary>
         /// Name of the service which is created to handle port forwarding to the job manager.
         /// </summary>
         private const string portForwardingServiceName = "job-manager-port-forwarding";
@@ -195,11 +200,6 @@ namespace APSIM.Cluster
         private Options options;
 
         private IEnumerable<string> workers;
-
-        /// <summary>
-        /// This task handles port forwarding to the remote job manager pod.
-        /// </summary>
-        private Task portForwarding;
 
         /// <summary>
         /// Create a new <see cref="Bootstrapper"/> instance.
@@ -291,12 +291,23 @@ namespace APSIM.Cluster
         /// <param name="command">Command to be sent.</param>
         public void SendCommand(ICommand command)
         {
-            InitiatePortForwarding();
-            // ip = portForwarding.Spec.ClusterIP;
-            string ip = "127.0.0.1";
-            uint port = jobManagerPortNo; // fixme
-            using (var conn = new NetworkSocketClient(options.Verbose, ip, port, Protocol.Native))
-                conn.SendCommand(command);
+            using (CancellationTokenSource cts = new CancellationTokenSource())
+            {
+                Task portForwarding = InitiatePortForwarding(jobManagerPodName, jobNamespace, (int)jobManagerPortNo, cts.Token);
+                try
+                {
+                    string ip = "127.0.0.1"; // IPAddress.Loopback
+                    uint port = jobManagerPortNo; // fixme
+                    using (var conn = new NetworkSocketClient(options.Verbose, ip, port, Protocol.Managed))
+                        // Note - SendCommand will wait for the command to finish.
+                        conn.SendCommand(command);
+                }
+                finally
+                {
+                    cts.Cancel();
+                    portForwarding.Wait();
+                }
+            }
         }
 
         /// <summary>
@@ -537,7 +548,7 @@ namespace APSIM.Cluster
             V1PodSpec spec = new V1PodSpec(
                 containers: new[] { CreateJobManagerContainer(actualInputFile, options.CpuCount) },
                 serviceAccountName: serviceAccountName,
-                restartPolicy: "Always" // If the job manager falls over for some reason, restart it.
+                restartPolicy: "Never" // If the job manager falls over for some reason, restart it.
                 // In theory, it doesn't really have any longterm state so this should be fine.
             );
             return new V1Pod(apiVersion, "Pod", metadata, spec);
@@ -551,7 +562,7 @@ namespace APSIM.Cluster
         private V1Container CreateJobManagerContainer(string inputFile, uint cpuCount)
         {
             string cpuString = cpuCount.ToString(CultureInfo.InvariantCulture);
-            containerArgs = new string[] { "-c", $"until [ -f /start ]; do sleep 1; done; echo File upload complete, starting job manager && /apsim/apsim-server relay --in-pod -vrnc {cpuString} --namespace {jobNamespace} -f {inputFile} -p {jobManagerPortNo}" };
+            containerArgs = new string[] { "-c", $"until [ -f /start ]; do sleep 1; done; echo File upload complete, starting job manager && /apsim/apsim-server relay --in-pod -vkrmc {cpuString} --namespace {jobNamespace} -f {inputFile} -p {jobManagerPortNo}" };
             return new V1Container(
                 jobManagerContainerName,
                 image: imageName,
@@ -720,7 +731,7 @@ namespace APSIM.Cluster
             V1ObjectMeta metadata = new V1ObjectMeta(name: podName);
             V1PodSpec spec = new V1PodSpec()
             {
-                Containers = new[] { ApsimServerContainer(GetContainerName(podName), file) }
+                Containers = new[] { CreateWorkerContainerTemplate(GetContainerName(podName), file) }
             };
             return new V1Pod(apiVersion, metadata: metadata, spec: spec);
         }
@@ -735,19 +746,20 @@ namespace APSIM.Cluster
         }
 
         /// <summary>
-        /// Get the containers run in a worker node (pod).
-        /// Currently this is a single apsiminitiative/apsimng-server container.
+        /// Create a container template for a worker node.
         /// </summary>
         /// <param name="name">Display name for the container.</parama>
         /// <param name="file">The input file on which the container should run.</param>
-        private V1Container ApsimServerContainer(string name, string file)
+        private V1Container CreateWorkerContainerTemplate(string name, string file)
         {
             string fileName = Path.GetFileName(file);
             // fixme - this is hacky and nasty
             string[] args = new[]
             {
                 "-c",
-                $"mkdir -p {workerInputsPath} && until [ -f {containerStartFile} ]; do sleep 1; done; echo File upload complete, starting server && /apsim/apsim-server listen -vkrnf {workerInputsPath}/{fileName} -a 0.0.0.0 -p {27746}" // todo: extract port # to user param
+                // todo: extract port # to user param
+                // todo: use pod's internal IP address rather than 0.0.0.0
+                $"mkdir -p {workerInputsPath} && until [ -f {containerStartFile} ]; do sleep 1; done; echo File upload complete, starting server && /apsim/apsim-server listen -vkrmf {workerInputsPath}/{fileName} -a 0.0.0.0 -p {workerNodePortNo}"
             };
 
             return new V1Container(
@@ -937,64 +949,110 @@ namespace APSIM.Cluster
         }
 
         /// <summary>
-        /// Initiate port forwarding to the job manager pod.
+        /// Initiate port forwarding from localhost to the job manager,
+        /// allowing us to connect to the job manager pod.
+        /// 
+        /// This function returns a task which probably should not be
+        /// immediately awaited. Instead, perform whatever operation
+        /// by connecting to the pod, then cancel the token passed into
+        /// this function, then await the result of this function.
         /// </summary>
-        private void InitiatePortForwarding()
+        /// <remarks>
+        /// Note this will only accept a single connection. It's also
+        /// single-threaded, it won't handle concurrent requests well.
+        /// </remarks>
+        /// <param name="cancelToken">Cancellation token.</param>
+        private async Task InitiatePortForwarding(string podName, string podNamespace, int portNo, CancellationToken cancelToken)
         {
-            portForwarding = Forward();
-        }
-
-        private async Task Forward()
-        {
-            // Note this is single-threaded, it won't handle concurrent requests well...
-            var task = client.WebSocketNamespacedPodPortForwardAsync(jobManagerPodName, jobNamespace, new int[] { (int)jobManagerPortNo }, webSocketSubProtocol: "v4.channel.k8s.io");
-            task.Wait();
-            var webSocket = task.Result;
-            var demux = new StreamDemuxer(webSocket, StreamType.PortForward);
-            demux.Start();
-
-            var stream = demux.GetStream((byte?)0, (byte?)0);
-            IPAddress ipAddress = IPAddress.Loopback;
-            IPEndPoint localEndPoint = new IPEndPoint(ipAddress, (int)jobManagerPortNo);
-            Socket listener = new Socket(ipAddress.AddressFamily, SocketType.Stream, ProtocolType.Tcp); 
-            listener.Bind(localEndPoint);  
-            listener.Listen(100);
-
-            Socket handler = null;
-
-            // Note this will only accept a single connection
-            var accept = Task.Run(() =>
+            // We need to wait for this task to complete before returning. Otherwise
+            // the caller might proceed to attempt a connection without await-ing,
+            // which will result in a connection refused error because we are still
+            // waiting for this task to return before starting the socket server.
+            Task<WebSocket> task = client.WebSocketNamespacedPodPortForwardAsync(podName, podNamespace, new int[] { portNo }, "v4.channel.k8s.io");
+            task.Wait(cancelToken);
+            using (WebSocket webSocket = task.Result)
             {
-                while (true)
+                using (StreamDemuxer demuxer = new StreamDemuxer(webSocket, StreamType.PortForward))
                 {
-                    handler = listener.Accept();
-                    var bytes = new byte[4096];
-                    while (true)
+                    demuxer.Start();
+
+                    // This is a hack to ensure that the stream demuxer closes correctly.
+                    // Without this, we will timeout inside ReadAsync(), despite the
+                    // cancellation token being passed in correctly. This appears to be
+                    // a bug in the kubernetes client, and one without a ready fix.
+                    cancelToken.Register(() => demuxer.Dispose());
+
+                    // This stream acts as a proxy between the client connected to the
+                    // socket. It reads from the client and forwards data through to the
+                    // job manager pod. It also reads data from the job manager pod and
+                    // sends it back to the client connected to the socket.
+                    Stream stream = demuxer.GetStream((byte?)0, (byte?)0);
+
+                    // Create a socket server listening on the specified port.
+                    IPAddress ipAddress = IPAddress.Loopback;
+                    IPEndPoint localEndPoint = new IPEndPoint(ipAddress, portNo);
+                    using (Socket listener = new Socket(ipAddress.AddressFamily, SocketType.Stream, ProtocolType.Tcp))
                     {
-                        int bytesRec = handler.Receive(bytes);
-                        stream.Write(bytes, 0, bytesRec);
-                        if (bytesRec == 0 || Encoding.ASCII.GetString(bytes,0,bytesRec).IndexOf("<EOF>") > -1)
-                            break;  
+                        listener.Bind(localEndPoint);  
+                        listener.Listen(100);
+
+                        // This is the socket handle for connected clients.
+                        // fixme - need to make this cancellable
+                        using (Socket handler = await listener.AcceptAsync().ConfigureAwait(false))
+                        {
+                            // This task relays data received from the client through to the pod.
+                            Task accept = PortForwardingRelayToPod(handler, listener, stream, cancelToken);
+
+                            // This task relays data received from the pod back to the client.
+                            Task copy = PortForwardingRelayToClient(handler, stream, cancelToken);
+
+                            await accept.ConfigureAwait(false);
+                            await copy.ConfigureAwait(false);
+                        }
                     }
                 }
-            });
+            }
+        }
 
-            var copy = Task.Run(() =>
+        private async Task PortForwardingRelayToClient(Socket handler, Stream stream, CancellationToken cancelToken)
+        {
+            try
             {
-                var buff = new byte[4096];
+                byte[] buff = new byte[4096];
                 while (true)
                 {
-                    var read = stream.Read(buff, 0, 4096);
-                    handler.Send(buff, read, 0);
+                    int read = await stream.ReadAsync(buff, 0, 4096, cancelToken);
+                    handler.Send(buff, read, 0); // fixme - use async api
+                    cancelToken.ThrowIfCancellationRequested();
                 }
-            });
-
-            await accept;
-            await copy;
-            if (handler != null) {
-                handler.Close();
             }
-            listener.Close();
+            catch (OperationCanceledException)
+            {
+                // This is normal.
+                // WriteToLog($"Relay to client: task was cancelled");
+            }
+        }
+
+        private async Task PortForwardingRelayToPod(Socket handler, Socket listener, Stream stream, CancellationToken cancelToken)
+        {
+            try
+            {
+                byte[] bytes = new byte[4096];
+                while (true)
+                {
+                    cancelToken.ThrowIfCancellationRequested();
+
+                    int messageLength = await handler.ReceiveAsync(bytes, SocketFlags.None, cancelToken);
+                    stream.Write(bytes, 0, messageLength); // fixme - use async api
+                    if (messageLength == 0 || Encoding.ASCII.GetString(bytes, 0, messageLength).IndexOf("<EOF>") > -1) // ahhh
+                        break;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // This is normal.
+                // WriteToLog("Relay to pod: task was canceled");
+            }
         }
     }
 }

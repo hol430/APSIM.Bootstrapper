@@ -37,6 +37,7 @@ namespace APSIM.Cluster
                 bootstrapper.Run();
                 ICommand command = new RunCommand(new Models.Core.Run.IReplacement[0]);
                 bootstrapper.SendCommand(command);
+                bootstrapper.SendCommand(command);
 
                 // TestCopyFile.TestCompressToProcess();
 
