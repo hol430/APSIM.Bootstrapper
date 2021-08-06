@@ -17,6 +17,7 @@ using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Text;
 using System.Threading.Tasks;
+using System.Data;
 
 namespace APSIM.Cluster
 {
@@ -220,7 +221,7 @@ namespace APSIM.Cluster
         /// <summary>
         /// Run the bootstrapper - initialise the cluster environment.
         /// </summary>
-        internal void Run()
+        internal void Initialise()
         {
             // Create the namespace in which the job manager pod will run.
             CreateNamespace();
@@ -289,23 +290,71 @@ namespace APSIM.Cluster
         /// Send a command to the cluster.
         /// </summary>
         /// <param name="command">Command to be sent.</param>
-        public void SendCommand(ICommand command)
+        public void RunWithChanges(RunCommand command)
         {
+            WriteToLog($"Executing {command}");
+
+            var stopwatch = Stopwatch.StartNew();
             using (CancellationTokenSource cts = new CancellationTokenSource())
             {
+                WriteToLog($"Initiating port forwarding to job manager...");
                 Task portForwarding = InitiatePortForwarding(jobManagerPodName, jobNamespace, (int)jobManagerPortNo, cts.Token);
                 try
                 {
                     string ip = "127.0.0.1"; // IPAddress.Loopback
                     uint port = jobManagerPortNo; // fixme
+                    WriteToLog($"Initiating connection to job manager...");
                     using (var conn = new NetworkSocketClient(options.Verbose, ip, port, Protocol.Managed))
+                    {
+                        WriteToLog($"Successfully established connection to job manager. Running command...");
                         // Note - SendCommand will wait for the command to finish.
                         conn.SendCommand(command);
+                        WriteToLog($"Command executed successfully. Disconnecting...");
+                    }
                 }
                 finally
                 {
+                    WriteToLog("Stopping port forwarding...");
                     cts.Cancel();
                     portForwarding.Wait();
+                    WriteToLog("Port forwarding has been stopped.");
+                }
+            }
+            stopwatch.Stop();
+            Console.WriteLine($"{command} ran in {stopwatch.ElapsedMilliseconds}ms");
+        }
+
+        public DataTable ReadOutput(ReadCommand command)
+        {
+            WriteToLog($"Executing {command}");
+
+            var stopwatch = Stopwatch.StartNew();
+            using (CancellationTokenSource cts = new CancellationTokenSource())
+            {
+                WriteToLog($"Initiating port forwarding to job manager...");
+                Task portForwarding = InitiatePortForwarding(jobManagerPodName, jobNamespace, (int)jobManagerPortNo, cts.Token);
+                try
+                {
+                    string ip = "127.0.0.1"; // IPAddress.Loopback
+                    uint port = jobManagerPortNo; // fixme
+                    WriteToLog($"Initiating connection to job manager...");
+                    using (var conn = new NetworkSocketClient(options.Verbose, ip, port, Protocol.Managed))
+                    {
+                        WriteToLog($"Successfully established connection to job manager. Running command...");
+                        // Note - SendCommand will wait for the command to finish.
+                        DataTable result = conn.ReadOutput(command);
+                        WriteToLog($"Command executed successfully. Disconnecting...");
+                        return result;
+                    }
+                }
+                finally
+                {
+                    WriteToLog("Stopping port forwarding...");
+                    cts.Cancel();
+                    portForwarding.Wait();
+                    WriteToLog("Port forwarding has been stopped.");
+                    stopwatch.Stop();
+                    Console.WriteLine($"{command} ran in {stopwatch.ElapsedMilliseconds}ms");
                 }
             }
         }
@@ -1031,6 +1080,14 @@ namespace APSIM.Cluster
                 // This is normal.
                 // WriteToLog($"Relay to client: task was cancelled");
             }
+            catch (Exception)
+            {
+                // Cancellation of the stream demuxer can lead to a broken pipe.
+                // In this situation, don't propagate such an error. Normally,
+                // the exception will be an IOException or SocketException.
+                if (!cancelToken.IsCancellationRequested)
+                    throw;
+            }
         }
 
         private async Task PortForwardingRelayToPod(Socket handler, Socket listener, Stream stream, CancellationToken cancelToken)
@@ -1052,6 +1109,14 @@ namespace APSIM.Cluster
             {
                 // This is normal.
                 // WriteToLog("Relay to pod: task was canceled");
+            }
+            catch (Exception)
+            {
+                // Cancellation of the stream demuxer can lead to a broken pipe.
+                // In this situation, don't propagate such an error. Normally,
+                // the exception will be an IOException or SocketException.
+                if (!cancelToken.IsCancellationRequested)
+                    throw;
             }
         }
     }

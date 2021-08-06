@@ -1,9 +1,13 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Data;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
 using APSIM.Server.Commands;
+using APSIM.Shared.Utilities;
 using CommandLine;
+using Models.Core.Run;
 
 namespace APSIM.Cluster
 {
@@ -34,10 +38,35 @@ namespace APSIM.Cluster
             try
             {
                 bootstrapper = new Bootstrapper(options);
-                bootstrapper.Run();
-                ICommand command = new RunCommand(new Models.Core.Run.IReplacement[0]);
-                bootstrapper.SendCommand(command);
-                bootstrapper.SendCommand(command);
+
+                // 1. Initialise the job.
+                bootstrapper.Initialise();
+
+                // Let's do this bit twice, just for fun.
+                for (int i = 0; i < 2; i++)
+                {
+                    // 2. Run everything.
+                    RunCommand command = new RunCommand(new IReplacement[0]);
+                    bootstrapper.RunWithChanges(command);
+
+                    // 3. Read outputs.
+                    IEnumerable<string> parameters = new[]
+                    {
+                        "Date",
+                        "BiomassWt",
+                        "Yield"
+                    };
+                    ReadCommand readCommand = new ReadCommand("Report", parameters);
+                    DataTable outputs = bootstrapper.ReadOutput(readCommand);
+                    Console.WriteLine("Received output from cluster:");
+                    Console.WriteLine(DataTableUtilities.ToMarkdown(outputs, true));
+                }
+
+                // 4. Cleanup all provisioned resources.
+                bootstrapper.Dispose();
+
+                // next - test rerunning with changed inputs - should cause changed outputs
+                // bootstrapper.RunWithChanges(command);
 
                 // TestCopyFile.TestCompressToProcess();
 
