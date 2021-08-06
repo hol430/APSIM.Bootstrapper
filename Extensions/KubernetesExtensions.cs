@@ -11,7 +11,7 @@ using ICSharpCode.SharpZipLib.Tar;
 using k8s;
 using k8s.Models;
 
-namespace APSIM.Cluster.Extensions
+namespace APSIM.Bootstrapper.Extensions
 {
     /// <summary>
     /// Hack to use kubectl for file copying.

@@ -1,7 +1,7 @@
 using System;
 using Microsoft.Rest;
 
-namespace APSIM.Cluster
+namespace APSIM.Bootstrapper
 {
     /// <summary>
     /// Encapsulates a kubernetes API exception.

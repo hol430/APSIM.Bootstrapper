@@ -9,7 +9,7 @@ using APSIM.Shared.Utilities;
 using CommandLine;
 using Models.Core.Run;
 
-namespace APSIM.Cluster
+namespace APSIM.Bootstrapper
 {
     class Program
     {

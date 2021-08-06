@@ -1,6 +1,6 @@
 using CommandLine;
 
-namespace APSIM.Cluster
+namespace APSIM.Bootstrapper
 {
     public class Options
     {
