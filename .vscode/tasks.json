@@ -7,7 +7,7 @@
             "type": "process",
             "args": [
                 "build",
-                "${workspaceFolder}/APSIM.Bootstrapper.csproj",
+                "${workspaceFolder}/src/APSIM.Bootstrapper.csproj",
                 "/property:GenerateFullPaths=true",
                 "/consoleloggerparameters:NoSummary"
             ],
@@ -23,7 +23,7 @@
             "type": "process",
             "args": [
                 "publish",
-                "${workspaceFolder}/APSIM.Bootstrapper.csproj",
+                "${workspaceFolder}/src/APSIM.Bootstrapper.csproj",
                 "/property:GenerateFullPaths=true",
                 "/consoleloggerparameters:NoSummary"
             ],
@@ -36,7 +36,7 @@
             "args": [
                 "watch",
                 "run",
-                "${workspaceFolder}/APSIM.Bootstrapper.csproj",
+                "${workspaceFolder}/src/APSIM.Bootstrapper.csproj",
                 "/property:GenerateFullPaths=true",
                 "/consoleloggerparameters:NoSummary"
             ],

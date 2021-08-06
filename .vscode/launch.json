@@ -9,7 +9,7 @@
             "type": "coreclr",
             "request": "launch",
             "preLaunchTask": "build",
-            "program": "${workspaceFolder}/bin/Debug/net5.0/APSIM.Bootstrapper.dll",
+            "program": "${workspaceFolder}/src/bin/Debug/net5.0/APSIM.Bootstrapper.dll",
             "args": [
                 "-vf",
                 // path to .apsimx file here
