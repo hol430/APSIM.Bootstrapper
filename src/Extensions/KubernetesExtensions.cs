@@ -153,7 +153,9 @@ namespace APSIM.Bootstrapper.Extensions
 
             Process proc = new Process();
             proc.StartInfo.FileName = "kubectl";
-            proc.StartInfo.Arguments = $"cp {sourceFilePath} {pod.Namespace()}/{pod.Name()}:{destinationFilePath} -c {container}";
+            string sourceFile = Path.GetFileName(sourceFilePath);
+            proc.StartInfo.Arguments = $"cp {sourceFile} {pod.Namespace()}/{pod.Name()}:{destinationFilePath} -c {container}";
+            proc.StartInfo.WorkingDirectory = Path.GetDirectoryName(sourceFilePath);
             proc.StartInfo.RedirectStandardOutput = true;
             proc.StartInfo.RedirectStandardError = true;
             proc.Start();

@@ -57,7 +57,7 @@ namespace APSIM.Bootstrapper
         /// <summary>
         /// Name of the docker image used by the job manager.
         /// </summary>
-        private const string imageName = "apsiminitiative/apsimng-server:custom";
+        private const string imageName = "apsiminitiative/apsimng-server:latest";
 
         /// <summary>
         /// Name of the job manager pod.
@@ -628,7 +628,7 @@ namespace APSIM.Bootstrapper
                 image: imageName,
                 command: new[] { containerEntrypoint },
                 args: containerArgs,
-                imagePullPolicy: "Never"
+                imagePullPolicy: "Always"
             );
         }
 
@@ -856,7 +856,7 @@ namespace APSIM.Bootstrapper
             {
                 WriteToLog($"Sending input file {file} to pod {podName}...");
                 V1Pod pod = GetPod(podName);
-                string destination = Path.Combine(destinationDirectory, Path.GetFileName(file));
+                string destination = $"{destinationDirectory}/{Path.GetFileName(file)}";
                 client.CopyFileToPod(pod, GetContainerName(podName), file, destination);
             }
         }
