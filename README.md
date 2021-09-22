@@ -21,9 +21,9 @@ The [ApsimX](https://github.com/APSIMInitiative/ApsimX) repository needs to be c
 The project supports a few command-line arguments. These may be viewed with the `--help` flag. The only essential argument is the input file, which may be specified using the `-f` flag:
 
 ```
-$ dotnet run -- -f /path/to/input/file.apsimx
+dotnet run -- -f /path/to/input/file.apsimx
 
-$ dotnet /path/to/APSIM.Bootstrapper.dll -f /path/to/input/file.apsimx
+dotnet /path/to/APSIM.Bootstrapper.dll -f /path/to/input/file.apsimx
 ```
 
 Currently this requires code changes for use in a non-minikube kubernetes environment (e.g. a real cluster).
