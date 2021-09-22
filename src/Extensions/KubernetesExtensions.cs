@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -173,6 +174,17 @@ namespace APSIM.Bootstrapper.Extensions
             if (!Directory.Exists(sourceDirectoryPath))
                 throw new DirectoryNotFoundException($"Directory {sourceDirectoryPath} does not exist");
             client.CopyFileToPod(pod, container, sourceDirectoryPath, destinationDirectoyPath, cancellationToken);
+        }
+
+        /// <summary>
+        /// Get the state of a particular container in a pod.
+        /// </summary>
+        /// <param name="client">Kubernetes client.</param>
+        /// <param name="pod">The pod.</param>
+        /// <param name="containerName">Name of a container inside the pod.</param>
+        public static V1ContainerState GetContainerState(this Kubernetes client, V1Pod pod, string containerName)
+        {
+            return pod.Status.ContainerStatuses.FirstOrDefault(c => c.Name == containerName).State;
         }
 
         private static bool IsKubectlInstalled()

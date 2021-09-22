@@ -249,6 +249,7 @@ namespace APSIM.Bootstrapper
                 CreateWorkers();
 
                 // Wait up to 10 seconds for the pods to start.
+                WaitFor(jobManagerPodName, IsReady, 10);
                 WaitForPodsToStart(workers.Append(jobManagerPodName), 10 * 1000);
 
                 // Copy the input files into the job manager pod.
@@ -281,6 +282,19 @@ namespace APSIM.Bootstrapper
                 Dispose();
                 throw;
             }
+        }
+
+        private bool IsReady(V1Pod pod)
+        {
+            string podName = pod.Name();
+            string containerName = GetContainerName(podName);
+            V1ContainerState state = client.GetContainerState(pod, containerName);
+            if (state.Terminated != null)
+            {
+                string log = GetLog(jobNamespace, podName, containerName);
+                throw new Exception($"Pod {pod.Name()} has failed:\n{log}");
+            }
+            return state.Running != null;
         }
 
         /// <summary>
@@ -417,19 +431,47 @@ namespace APSIM.Bootstrapper
         }
 
         /// <summary>
+        /// Monitor a pod until a condition is met, or until a certain period of time has elapsed.
+        /// </summary>
+        /// <param name="podName">Name of the pod to be monitored.</param>
+        /// <param name="condition">Condition - when this returns true, monitoring will cease.</param>
+        /// <param name="maxTime">Max amount of time to wait (in seconds).</param>
+        private void WaitFor(string podName, Func<V1Pod, bool> condition, int maxTime)
+        {
+            try
+            {
+                CancellationTokenSource cts = new CancellationTokenSource(maxTime * 1000);
+                WaitForAsync(podName, condition, cts.Token).Wait(cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        /// <summary>
         /// Monitor a pod and wait for a condition to evaluate to true.
         /// </summary>
         /// <param name="podName">Name of the pod to be watched.</param>
         /// <param name="condition">Condition for which to wait.</param>
-        private async Task WaitFor(string podName, Func<V1Pod, bool> condition, CancellationToken cancelToken)
+        private async Task WaitForAsync(string podName, Func<V1Pod, bool> condition, CancellationToken cancelToken)
         {
-            HttpOperationResponse<V1PodList> pods = await client.ListNamespacedPodWithHttpMessagesAsync(jobNamespace, watch: true, cancellationToken: cancelToken);
-            Action<WatchEventType, V1Pod> onEvent = (_, pod) => { if (condition(pod)) return; };
+            bool conditionMet = false;
+            Action<WatchEventType, V1Pod> onEvent = (_, pod) => { conditionMet = condition(pod); };
             Action<Exception> errorHandler = e => throw e;
             Action closureHandler = () => throw new Exception($"Connection closed unexpectedly while watching pod {podName}");
-            using (Watcher<V1Pod> watcher = pods.Watch<V1Pod, V1PodList>(onEvent, errorHandler, closureHandler))
+
+            // Start monitoring the pod.
+            using (Watcher<V1Pod> watcher = await client.WatchNamespacedPodAsync(podName, jobNamespace, onEvent: onEvent, onError: errorHandler, onClosed: closureHandler, cancellationToken: cancelToken))
             {
-                // client.WatchNamespacedPodAsync(podName, jobNamespace, )
+                // The callback will only be invoked when the pod's state has changed. So we
+                // manually check the condition now, in case the pod has already reached a
+                // state which satisfies the given condition.
+                V1Pod pod = await client.ReadNamespacedPodAsync(podName, jobNamespace, cancellationToken: cancelToken);
+                if (condition(pod))
+                    return;
+
+                // Wait until the condition has been met.
+                SpinWait.SpinUntil(() => conditionMet || cancelToken.IsCancellationRequested);
             }
         }
 
