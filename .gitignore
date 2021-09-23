@@ -1,3 +1,4 @@
 bin/
 obj/
-
+*.apsimx.bak
+*.db*
