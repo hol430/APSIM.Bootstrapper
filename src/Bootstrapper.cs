@@ -261,6 +261,7 @@ namespace APSIM.Bootstrapper
                 // InitiatePortForwarding();
 
                 // Monitor the job manager pod for 10 seconds to ensure that it is healthy.
+                // fixme - this is unnecessarily slow. need some sort of signal here
                 int seconds = 10;
                 VerifyPodHealth(jobManagerPodName, seconds * 1000);
 
@@ -282,6 +283,15 @@ namespace APSIM.Bootstrapper
                 Dispose();
                 throw;
             }
+        }
+
+        private bool WorkerIsReady(V1Pod pod)
+        {
+            string podName = pod.Name();
+            string containerName = GetContainerName(podName);
+            string log = GetLog(jobNamespace, podName, containerName);
+            // fixme - need a proper signal here
+            return log.Contains("Waiting for connections", StringComparison.InvariantCultureIgnoreCase);
         }
 
         private bool IsReady(V1Pod pod)
@@ -789,8 +799,8 @@ namespace APSIM.Bootstrapper
             // Monitor the pods for some time.
             WriteToLog($"Monitoring worker pods...");
             int seconds = 10;
-            MonitorPods(seconds * 1000);
-            EnsureWorkersHaveWrittenOutput();
+            foreach (string worker in workers)
+                WaitFor(worker, WorkerIsReady, seconds);
 
             // Delete temp files.
             Directory.Delete(tempDir, true);
@@ -868,21 +878,17 @@ namespace APSIM.Bootstrapper
                 name,
                 image: imageName,
                 command: new string[] { "/bin/sh" },
-                args: args
+                args: args,
+                imagePullPolicy: "Always"
             );
         }
 
         private void WaitForWorkersToLaunch(int maxTimePerPod)
         {
             WriteToLog($"Waiting for pods to start...");
-            CancellationTokenSource source = new CancellationTokenSource();
 
             foreach (string worker in workers)
-            {
-                source.CancelAfter(maxTimePerPod);
-                VerifyPodHealth(worker, source.Token);
-                WriteToLog($"Pod {worker} is now online and waiting for input files.");
-            }
+                WaitFor(worker, IsReady, maxTimePerPod);
         }
 
         /// <summary>
@@ -982,19 +988,6 @@ namespace APSIM.Bootstrapper
             // string[] cmd = new[] { "touch", containerStartFile };
             // CancellationToken token = new CancellationTokenSource().Token;
             // client.NamespacedPodExecAsync(podName, podNamespace, container, cmd, false, action, token);
-        }
-
-        /// <summary>
-        /// Monitor the worker pods for the given duration, and throw
-        /// if any of the pods have failed.
-        /// </summary>
-        /// <param name="duration">Time period for which to montior pods (in ms).</param>
-        private void MonitorPods(int duration)
-        {
-            CancellationTokenSource source = new CancellationTokenSource(duration);
-            while (!source.IsCancellationRequested)
-                foreach (string worker in workers)
-                    VerifyPodHealth(worker);
         }
 
         private void EnsureWorkersHaveWrittenOutput()
