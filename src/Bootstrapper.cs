@@ -248,26 +248,19 @@ namespace APSIM.Bootstrapper
                 // Create worker pods.
                 CreateWorkers();
 
-                // Wait up to 10 seconds for the pods to start.
-                WaitFor(jobManagerPodName, IsReady, 10);
-                WaitForPodsToStart(workers.Append(jobManagerPodName), 10 * 1000);
+                // Wait for the job manager pod to finish creation/startup.
+                WriteToLog("Waiting for job manager pod to finish creation...");
+                CancellationTokenSource cts = new CancellationTokenSource(10 * 1000);
+                WaitFor(jobManagerPodName, IsReady, cts);
 
-                // Copy the input files into the job manager pod.
-                // The job manager will wait until this is complete before it
-                // launches the relay server.
+                // Send the start signal to the job manager pod.
+                // This will start the apsim server.
                 SendStartSignalToPod(jobManagerPodName);
 
-                // Initiate port forwarding to the job manager pod.
-                // InitiatePortForwarding();
+                // Wait for the apsim server to complete its initialisation.
+                WriteToLog("Waiting for job manager pod to finish initialisation...");
+                WaitFor(jobManagerPodName, ApsimServerIsListening, cts);
 
-                // Monitor the job manager pod for 10 seconds to ensure that it is healthy.
-                // fixme - this is unnecessarily slow. need some sort of signal here
-                int seconds = 10;
-                VerifyPodHealth(jobManagerPodName, seconds * 1000);
-
-                // Finally, verify that the pod has logged some output.
-                // (It should log output as soon as it receives the start signal.)
-                EnsurePodHasWrittenOutput(jobManagerPodName);
             }
             catch (HttpOperationException httpError)
             {
@@ -283,28 +276,6 @@ namespace APSIM.Bootstrapper
                 Dispose();
                 throw;
             }
-        }
-
-        private bool WorkerIsReady(V1Pod pod)
-        {
-            string podName = pod.Name();
-            string containerName = GetContainerName(podName);
-            string log = GetLog(jobNamespace, podName, containerName);
-            // fixme - need a proper signal here
-            return log.Contains("Waiting for connections", StringComparison.InvariantCultureIgnoreCase);
-        }
-
-        private bool IsReady(V1Pod pod)
-        {
-            string podName = pod.Name();
-            string containerName = GetContainerName(podName);
-            V1ContainerState state = client.GetContainerState(pod, containerName);
-            if (state.Terminated != null)
-            {
-                string log = GetLog(jobNamespace, podName, containerName);
-                throw new Exception($"Pod {pod.Name()} has failed:\n{log}");
-            }
-            return state.Running != null;
         }
 
         /// <summary>
@@ -409,49 +380,16 @@ namespace APSIM.Bootstrapper
         }
 
         /// <summary>
-        /// Monitor the specified pods until either they start (status changes to "Running"),
-        /// or the given amount of time passes.
-        /// </summary>
-        /// <param name="pods">The pods to monitor.</param>
-        /// <param name="timeout">Timeout period in milliseconds</param>
-        private void WaitForPodsToStart(IEnumerable<string> pods, int timeout)
-        {
-            var stopwatch = Stopwatch.StartNew();
-            List<string> podsToCheck = new List<string>(workers.Append(jobManagerPodName));
-            while (stopwatch.ElapsedMilliseconds < timeout && podsToCheck.Any())
-            {
-                foreach (string podName in podsToCheck)
-                {
-                    V1Pod pod = GetPod(podName);
-                    V1ContainerState state = pod.Status.ContainerStatuses.FirstOrDefault(c => c.Name == GetContainerName(podName)).State;
-                    if (state.Running != null || state.Terminated != null)
-                    {
-                        // This pod has started successfully. We can stop monitoring it.
-                        podsToCheck.Remove(podName);
-
-                        // (fixme - collection has been modified)
-                        break; // (out of the for loop)
-                    }
-
-                    if (state.Waiting != null && state.Waiting.Reason != "ContainerCreating")
-                        throw new Exception($"Job manager pod failed to start. Reason={state.Waiting.Reason}. Message: {state.Waiting.Message}");
-                }
-                
-            }
-        }
-
-        /// <summary>
-        /// Monitor a pod until a condition is met, or until a certain period of time has elapsed.
+        /// Monitor a pod until a condition is met, or until the cancellation token has expired.
         /// </summary>
         /// <param name="podName">Name of the pod to be monitored.</param>
         /// <param name="condition">Condition - when this returns true, monitoring will cease.</param>
-        /// <param name="maxTime">Max amount of time to wait (in seconds).</param>
-        private void WaitFor(string podName, Func<V1Pod, bool> condition, int maxTime)
+        /// <param name="cancelToken">This is used to cancel the wait operation..</param>
+        private void WaitFor(string podName, Func<V1Pod, bool> condition, CancellationTokenSource cancelToken)
         {
             try
             {
-                CancellationTokenSource cts = new CancellationTokenSource(maxTime * 1000);
-                WaitForAsync(podName, condition, cts.Token).Wait(cts.Token);
+                WaitForAsync(podName, condition, cancelToken.Token).Wait(cancelToken.Token);
             }
             catch (OperationCanceledException)
             {
@@ -467,11 +405,10 @@ namespace APSIM.Bootstrapper
         {
             bool conditionMet = false;
             Action<WatchEventType, V1Pod> onEvent = (_, pod) => { conditionMet = condition(pod); };
-            Action<Exception> errorHandler = e => throw e;
-            Action closureHandler = () => throw new Exception($"Connection closed unexpectedly while watching pod {podName}");
+            Action<Exception> errorHandler = e => { if (!conditionMet) throw e; };
 
             // Start monitoring the pod.
-            using (Watcher<V1Pod> watcher = await client.WatchNamespacedPodAsync(podName, jobNamespace, onEvent: onEvent, onError: errorHandler, onClosed: closureHandler, cancellationToken: cancelToken))
+            using (Watcher<V1Pod> watcher = await client.WatchNamespacedPodAsync(podName, jobNamespace, onEvent: onEvent, onError: errorHandler, cancellationToken: cancelToken))
             {
                 // The callback will only be invoked when the pod's state has changed. So we
                 // manually check the condition now, in case the pod has already reached a
@@ -483,6 +420,81 @@ namespace APSIM.Bootstrapper
                 // Wait until the condition has been met.
                 SpinWait.SpinUntil(() => conditionMet || cancelToken.IsCancellationRequested);
             }
+        }
+
+        /// <summary>
+        /// Check if there is an apsim server instance running on the given pod,
+        /// and that the server is listening for connections.
+        /// </summary>
+        /// <param name="pod">The pod to check.</param>
+        private bool ApsimServerIsListening(V1Pod pod)
+        {
+            string podName = pod.Name();
+            string containerName = GetContainerName(podName);
+            string log = GetLog(jobNamespace, podName, containerName);
+            V1ContainerState state = client.GetContainerState(pod, containerName);
+            if (state.Terminated != null)
+                throw new Exception($"Pod {pod.Name()} has failed:\n{log}");
+
+            // fixme - need a proper signal here
+            bool listening = log.Contains("Waiting for connections", StringComparison.InvariantCultureIgnoreCase);
+            WriteToLog($"Container {containerName} in pod {podName} is {(listening ? "" : "not ")}listening.");
+            return listening;
+        }
+
+        /// <summary>
+        /// Check if a given pod is 'ready' (ie - the pod is in a "running" state).
+        /// This method will throw if the pod has failed.
+        /// </summary>
+        private bool IsReady(V1Pod pod)
+        {
+            string podName = pod.Name();
+            string containerName = GetContainerName(podName);
+            V1ContainerState state = client.GetContainerState(pod, containerName);
+            if (state.Terminated != null)
+            {
+                string log = GetLog(jobNamespace, podName, containerName);
+                throw new Exception($"Pod {pod.Name()} has failed:\n{log}");
+            }
+            bool ready = state.Running != null;
+            Console.WriteLine($"Container {containerName} in pod {podName} is {(ready ? "" : "not ")}ready.");
+            return ready;
+        }
+
+        /// <summary>
+        /// Write a log message (ie to stdout).
+        /// </summary>
+        /// <remarks>
+        /// Current implementation is to write to stdout iff verbose option is enabled.
+        /// </remarks>
+        /// <param name="message">Message to be written.</param>
+        private void WriteToLog(string message)
+        {
+            if (options.Verbose)
+                Console.WriteLine(message);
+        }
+
+        /// <summary>
+        /// Read console output from a particular container in a pod.
+        /// </summary>
+        /// <param name="podNamespace">Namespace of the pod.</param>
+        /// <param name="podName">Pod name.</param>
+        /// <param name="containerName">Container name.</param>
+        /// <returns></returns>
+        private string GetLog(string podNamespace, string podName, string containerName)
+        {
+            using (Stream logStream = client.ReadNamespacedPodLog(podName, podNamespace, containerName))
+                using (StreamReader reader = new StreamReader(logStream))
+                    return reader.ReadToEnd();
+        }
+
+        /// <summary>
+        /// Get the name of the apsim-server container running in a given pod.
+        /// </summary>
+        /// <param name="podName">Name of the pod.</param>
+        private string GetContainerName(string podName)
+        {
+            return $"{podName}-container";
         }
 
         /// <summary>
@@ -685,63 +697,6 @@ namespace APSIM.Bootstrapper
         }
 
         /// <summary>
-        /// This function will monitor the a particular pod's health for the specified
-        /// period of time. An exception will be thrown if the pod fails to start.
-        /// </summary>
-        private void VerifyPodHealth(string pod, int duration)
-        {
-            string containerName = GetContainerName(pod);
-            WriteToLog("Verifying pod health...");
-            Stopwatch timer = Stopwatch.StartNew();
-            while (timer.ElapsedMilliseconds < duration)
-            {
-                // Check the job manager container's state. If it's fallen over, then
-                // we'll report the error immediately and clean up.
-                V1ContainerState state = GetPod(pod).Status.ContainerStatuses.FirstOrDefault(c => c.Name == containerName).LastState;
-                if (state.Terminated != null)
-                {
-                    // todo: check terminated reason
-                    // Get console output from the container.
-                    string containerLog = GetLog(jobNamespace, jobManagerPodName, containerName);
-                    string entrypoint = $"{containerEntrypoint} {string.Join(" ", containerArgs)}";
-                    throw new Exception($"Job manager pod failed to start (state = {state.Terminated.Reason}).\nContainer command:\n{entrypoint}\nContainer log:\n{containerLog}");
-                }
-            }
-
-            // Once it receives the input files, the pod should print a message to stdout.
-            // If this hasn't happened by now, something has gone wrong.
-            // if (string.IsNullOrEmpty(GetLog(jobNamespace, jobManagerPodName, jobManagerContainerName)))
-            //     throw new Exception("Job manager pod did not receive start signal");
-        }
-
-        /// <summary>
-        /// Write a log message (ie to stdout).
-        /// </summary>
-        /// <remarks>
-        /// Current implementation is to write to stdout iff verbose option is enabled.
-        /// </remarks>
-        /// <param name="message">Message to be written.</param>
-        private void WriteToLog(string message)
-        {
-            if (options.Verbose)
-                Console.WriteLine(message);
-        }
-
-        /// <summary>
-        /// Read console output from a particular container in a pod.
-        /// </summary>
-        /// <param name="podNamespace">Namespace of the pod.</param>
-        /// <param name="podName">Pod name.</param>
-        /// <param name="containerName">Container name.</param>
-        /// <returns></returns>
-        private string GetLog(string podNamespace, string podName, string containerName)
-        {
-            using (Stream logStream = client.ReadNamespacedPodLog(podName, podNamespace, containerName))
-                using (StreamReader reader = new StreamReader(logStream))
-                    return reader.ReadToEnd();
-        }
-
-        /// <summary>
         /// Initialise the worker nodes.
         /// </summary>
         /// <param name="client">The kubernetes client to be used.</param>
@@ -783,7 +738,10 @@ namespace APSIM.Bootstrapper
             WriteToLog($"Successfully created {pods.Count} pod{(pods.Count == 1 ? "" : "s")}.");
 
             // Wait for worker containers to launch.
-            WaitForWorkersToLaunch(10 * 1000);
+            WriteToLog($"Waiting for pods to start...");
+            CancellationTokenSource cts = new CancellationTokenSource(10 * 1000);
+            foreach (string worker in workers)
+                WaitFor(worker, IsReady, cts);
 
             // Send input files to pods.
             // The keys here are the pod names
@@ -796,16 +754,9 @@ namespace APSIM.Bootstrapper
                 SendStartSignalToPod(pod.Key);
             }
 
-            // Monitor the pods for some time.
-            WriteToLog($"Monitoring worker pods...");
-            int seconds = 10;
-            foreach (string worker in workers)
-                WaitFor(worker, WorkerIsReady, seconds);
-
             // Delete temp files.
             Directory.Delete(tempDir, true);
         }
-
 
         /// <summary>
         /// Split an .apsimx file into smaller chunks, of the given size.
@@ -849,15 +800,6 @@ namespace APSIM.Bootstrapper
         }
 
         /// <summary>
-        /// Get the name of the apsim-server container running in a given pod.
-        /// </summary>
-        /// <param name="podName">Name of the pod.</param>
-        private string GetContainerName(string podName)
-        {
-            return $"{podName}-container";
-        }
-
-        /// <summary>
         /// Create a container template for a worker node.
         /// </summary>
         /// <param name="name">Display name for the container.</parama>
@@ -883,14 +825,6 @@ namespace APSIM.Bootstrapper
             );
         }
 
-        private void WaitForWorkersToLaunch(int maxTimePerPod)
-        {
-            WriteToLog($"Waiting for pods to start...");
-
-            foreach (string worker in workers)
-                WaitFor(worker, IsReady, maxTimePerPod);
-        }
-
         /// <summary>
         /// Send the given files to the pod at the specified location.
         /// </summary>
@@ -907,17 +841,6 @@ namespace APSIM.Bootstrapper
                 string destination = $"{destinationDirectory}/{Path.GetFileName(file)}";
                 client.CopyFileToPod(pod, GetContainerName(podName), file, destination);
             }
-        }
-
-        /// <summary>
-        /// This function will monitor the job manager pod's health for the specified
-        /// period of time. An exception will be thrown if the pod fails to start.
-        /// </summary>
-        private void VerifyPodHealth(string podName, CancellationToken cancellationToken)
-        {
-            WriteToLog("Verifying pod health...");
-            while (!cancellationToken.IsCancellationRequested)
-                VerifyPodHealth(podName);
         }
 
         /// <summary>
@@ -988,20 +911,6 @@ namespace APSIM.Bootstrapper
             // string[] cmd = new[] { "touch", containerStartFile };
             // CancellationToken token = new CancellationTokenSource().Token;
             // client.NamespacedPodExecAsync(podName, podNamespace, container, cmd, false, action, token);
-        }
-
-        private void EnsureWorkersHaveWrittenOutput()
-        {
-            foreach (string worker in workers)
-                EnsurePodHasWrittenOutput(worker);
-        }
-
-        private void EnsurePodHasWrittenOutput(string podName)
-        {
-            string container = GetContainerName(podName);
-            string log = GetLog(jobNamespace, podName, container);
-            if (string.IsNullOrEmpty(log))
-                throw new Exception($"Pod {podName} has not written output after receiving start signal.");
         }
     }
 }
