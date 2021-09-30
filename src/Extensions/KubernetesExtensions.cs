@@ -184,7 +184,18 @@ namespace APSIM.Bootstrapper.Extensions
         /// <param name="containerName">Name of a container inside the pod.</param>
         public static V1ContainerState GetContainerState(this Kubernetes client, V1Pod pod, string containerName)
         {
-            return pod.Status.ContainerStatuses.FirstOrDefault(c => c.Name == containerName).State;
+            return client.GetContainerStatus(pod, containerName).State;
+        }
+
+        /// <summary>
+        /// Get the status of a particular container in a pod.
+        /// </summary>
+        /// <param name="client">Kubernetes client.</param>
+        /// <param name="pod">The pod.</param>
+        /// <param name="containerName">Name of a container inside the pod.</param>
+        public static V1ContainerStatus GetContainerStatus(this Kubernetes client, V1Pod pod, string containerName)
+        {
+            return pod.Status.ContainerStatuses.FirstOrDefault(c => c.Name == containerName);
         }
 
         private static bool IsKubectlInstalled()
