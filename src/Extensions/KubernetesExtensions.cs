@@ -160,12 +160,39 @@ namespace APSIM.Bootstrapper.Extensions
             proc.StartInfo.RedirectStandardOutput = true;
             proc.StartInfo.RedirectStandardError = true;
             proc.Start();
-            proc.WaitForExit();
-            if (proc.ExitCode != 0)
+            // int timeToWait = 5 * 1000; // ms
+
+            // Time to wait based on file size. Otherwise we get a timeout on
+            // long files vs wait to long for botched copies on small files.
+            long fileSize = (long)(new FileInfo(sourceFilePath).Length / Math.Pow(2, 20));
+
+            // Time to wait (in s) = file size (in MB).
+            // If this overflows, the file is >2PB.
+            int timeToWait = Math.Max(5, (int)fileSize) * 1000;
+
+            bool exited = proc.WaitForExit(timeToWait);
+            if (!exited)
+                proc.Kill();
+            if (!exited || proc.ExitCode != 0)
             {
                 string stdout = proc.StandardOutput.ReadToEnd();
                 string stderr = proc.StandardError.ReadToEnd();
-                throw new Exception($"Failed to copy {sourceFilePath} to pod {pod.Name()};\nstdout:\n{stdout}\nstderr:\n{stderr}");
+                int numRetries = 5;
+                for (int i = 0; i < numRetries; i++)
+                {
+                    Console.WriteLine($"Failed to copy file to {pod.Name()}. Retrying ({i + 1}/{numRetries})");
+                    proc.Start();
+                    exited = proc.WaitForExit(timeToWait);
+                    if (exited && proc.ExitCode == 0)
+                        break;
+                    if (!exited)
+                    {
+                        proc.Kill();
+                        proc.WaitForExit(1000);
+                    }
+                }
+                if (proc.ExitCode != 0)
+                    throw new Exception($"Failed to copy {sourceFilePath} to pod {pod.Name()};\nstdout:\n{stdout}\nstderr:\n{stderr}");
             }
         }
 
@@ -195,7 +222,7 @@ namespace APSIM.Bootstrapper.Extensions
         /// <param name="containerName">Name of a container inside the pod.</param>
         public static V1ContainerStatus GetContainerStatus(this Kubernetes client, V1Pod pod, string containerName)
         {
-            return pod.Status.ContainerStatuses.FirstOrDefault(c => c.Name == containerName);
+            return pod.Status.ContainerStatuses?.FirstOrDefault(c => c.Name == containerName);
         }
 
         private static bool IsKubectlInstalled()

@@ -14,11 +14,25 @@ using Microsoft.Rest;
 using Models.Core.Run;
 using System.Data;
 using System.Threading.Tasks;
+using System.Text.RegularExpressions;
+using APSIM.Bootstrapper.Logging;
+using System.Net;
 
 namespace APSIM.Bootstrapper
 {
-    public class Bootstrapper
+    public class Bootstrapper : IDisposable
     {
+        /// <summary>
+        /// Number of simulations per pod. This should probably be equal to
+        /// # of vCPUs per node.
+        /// </summary>
+        private const uint chunkSize = 16;
+
+        /// <summary>
+        /// Number of iterations which the demo application should run.
+        /// </summary>
+        private const uint numIterations = 100;
+
         /// <summary>
         /// API Version passed into all kubernetes API requests.
         /// </summary>
@@ -97,6 +111,56 @@ namespace APSIM.Bootstrapper
         private const string containerStartFile = "/start";
 
         /// <summary>
+        /// A label with this name is added to all pods created by the bootstrapper.
+        /// </summary>
+        private const string podTypeLabelName = "dev.apsim.info/pod-type";
+
+        /// <summary>
+        /// All worker pods have their <see cref="podTypeLabelName"/> set to this value.
+        /// </summary>
+        private const string workerPodType = "worker";
+
+        /// <summary>
+        /// The job manager pod has its <see cref="podTypeLabelName"/> label set to this value.
+        /// </summary>
+        private const string jobManagerPodType = "job-manager";
+
+        /// <summary>
+        /// The optimiser pod has it s<see cref="podTypeLabelName"/> label set to this value.
+        /// </summary>
+        private const string optimiserPodType = "optimiser";
+
+        /// <summary>
+        /// This is the name of the "role" label given to all nodes in an openstack cluster.
+        /// </summary>
+        private const string openStackNodeRoleLabelName = "magnum.openstack.org/role";
+
+        /// <summary>
+        /// Name of the 'name' label given to all kubernetes nodes.
+        /// </summary>
+        private const string kubernetesNodeNameLabel = "kubernetes.io/hostname";
+
+        /// <summary>
+        /// This is the role given to 'master' nodes on openstack clusters.
+        /// </summary>
+        private const string openStackMasterNodeRole = "master";
+
+        /// <summary>
+        /// This is the role given to 'worker' nodes on openstack clusters.
+        /// </summary>
+        private const string openStackWorkerNodeRoleName = "workers";
+
+        /// <summary>
+        /// This is the role which should be given to 'job manager' nodes on openstack clusters.
+        /// </summary>
+        /// <remarks>
+        /// This is not a cluster default, and no job manager ndoes are actually required. However,
+        /// it can be useful to create a job manager node which has less CPUs than the
+        /// worker pods in order to improve overall CPU usage efficiency of the job.
+        /// </remarks>
+        private const string openStackJobManagerNodeRole = "job-manager-node";
+
+        /// <summary>
         /// The verbs given to the job manager's service account's role.
         /// </summary>
         /// <remarks>
@@ -148,22 +212,51 @@ namespace APSIM.Bootstrapper
         private const string roleName = "apsim-role";
 
         /// <summary>
+        /// The "In" operator used for node scheduling affinities. This is a constant
+        /// exposed by the kubernetes API.
+        /// </summary>
+        private const string @in = "In";
+
+        /// <summary>
+        /// The "NotIn" operator used for node scheduling affinities. This is a constant
+        /// exposed by the kubernetes API.
+        /// </summary>
+        private const string notIn = "NotIn";
+
+        /// <summary>
         /// Port on which the job manager listens for connections.
         /// </summary>
         /// <remarks>
         /// fixme: this could be a user parameter as it could conflict with other services???
         /// </remarks>
-        private const uint jobManagerPortNo = 27746;
+        private const ushort jobManagerPortNo = 27746;
 
         /// <summary>
-        /// Port on which the worker nodes listen for connections.
+        /// Port on which the worker pods listen for connections.
         /// </summary>
-        private const uint workerNodePortNo = 27746;
+        private const ushort workerPodPortNo = 27746;
 
         /// <summary>
         /// Name of the service which is created to handle port forwarding to the job manager.
         /// </summary>
         private const string portForwardingServiceName = "job-manager-port-forwarding";
+
+        /// <summary>
+        /// This specifies behaviour for a pod spread constraint when the constraint
+        /// cannot be satisfied. This behaviour is to schedule the pod anyway.
+        /// </summary>
+        private const string scheduleAnyway = "ScheduleAnyway";
+
+        /// <summary>
+        /// This specifies behaviour for a pod spread constraint when the constraint
+        /// cannot be satisfied. This behaviour is to not scheudle the pod.
+        /// </summary>
+        private const string doNotSchedule = "DoNotSchedule";
+
+        /// <summary>
+        /// Describes the "if not present" image pull policy.
+        /// </summary>
+        private const string ifNotPresent = "IfNotPresent";
 
         // Stateful variables
 
@@ -218,17 +311,18 @@ namespace APSIM.Bootstrapper
                 throw new FileNotFoundException($"File {options.InputFile} does not exist");
         }
 
-        /// <summary>
-        /// Run the bootstrapper - initialise the cluster environment.
-        /// </summary>
-        internal void Initialise()
+        public void Initialise()
         {
             // Create the namespace in which the job manager pod will run.
             CreateNamespace();
-#if DEBUG
-            // WriteToLog($"kubectl exec --stdin --tty -n {jobNamespace} {jobManagerPodName} -- /bin/bash");
-            WriteToLog($"export namespace={jobNamespace}");
-#endif
+            Console.WriteLine($"export namespace={jobNamespace}");
+        }
+
+        /// <summary>
+        /// Run the bootstrapper - initialise the cluster environment.
+        /// </summary>
+        internal void CreateDefaultSetup()
+        {
             try
             {
                 // Create a service account for the job manager pod.
@@ -249,8 +343,8 @@ namespace APSIM.Bootstrapper
                 CreateWorkers();
 
                 // Wait for the job manager pod to finish creation/startup.
-                WriteToLog("Waiting for job manager pod to start...");
-                CancellationTokenSource cts = new CancellationTokenSource(10 * 1000);
+                WriteToLog("Waiting for job manager pod to start...", Verbosity.Information);
+                CancellationTokenSource cts = new CancellationTokenSource(100 * 1000);
                 WaitFor(jobManagerPodName, HasStarted, cts);
 
                 // Send the start signal to the job manager pod.
@@ -258,10 +352,10 @@ namespace APSIM.Bootstrapper
                 SendStartSignalToPod(jobManagerPodName);
 
                 // Wait for the apsim server to complete its initialisation.
-                WriteToLog("Waiting for job manager pod to enter ready state...");
+                WriteToLog("Waiting for job manager pod to enter ready state...", Verbosity.Information);
                 WaitFor(jobManagerPodName, IsReady, cts);
 
-                WriteToLog("Waiting for worker nodes to enter ready state...");
+                WriteToLog("Waiting for worker nodes to enter ready state...", Verbosity.Information);
                 foreach (string worker in workers)
                     WaitFor(worker, IsReady, cts);
             }
@@ -282,12 +376,22 @@ namespace APSIM.Bootstrapper
         }
 
         /// <summary>
+        /// Get the IP Address of a pod.
+        /// </summary>
+        /// <param name="podName">Name of the pod.</param>
+        private string GetPodIPAddress(string podName)
+        {
+            V1Pod pod = GetPod(podName);
+            return pod.Status.PodIP;
+        }
+
+        /// <summary>
         /// Issue a RUN command to the job manager.
         /// </summary>
         /// <param name="command">Command to be sent.</param>
         public void RunWithChanges(RunCommand command)
         {
-            WriteToLog($"Executing {command}");
+            WriteToLog($"Executing {command}", Verbosity.Information);
 
             var stopwatch = Stopwatch.StartNew();
 
@@ -295,21 +399,21 @@ namespace APSIM.Bootstrapper
             using (PortForwardingService service = new PortForwardingService(client))
             {
                 // Start the socket server.
-                WriteToLog($"Initiating port forwarding to job manager...");
+                WriteToLog($"Initiating port forwarding to job manager...", Verbosity.Information);
                 int port = service.Start(jobManagerPodName, jobNamespace, (int)jobManagerPortNo);
 
                 // fixme: IPAddress.Loopback
                 string ip = "127.0.0.1";
 
-                WriteToLog($"Initiating connection to job manager...");
+                WriteToLog($"Initiating connection to job manager...", Verbosity.Information);
                 using (var conn = new NetworkSocketClient(options.Verbose, ip, (uint)port, Protocol.Managed))
                 {
-                    WriteToLog($"Successfully established connection to job manager. Running command...");
+                    WriteToLog($"Successfully established connection to job manager. Running command...", Verbosity.Information);
 
                     // Note - SendCommand will wait for the command to finish.
                     conn.SendCommand(command);
 
-                    WriteToLog($"Command executed successfully. Disconnecting...");
+                    WriteToLog($"Command executed successfully. Disconnecting...", Verbosity.Information);
                 }
             }
 
@@ -323,7 +427,7 @@ namespace APSIM.Bootstrapper
         /// <param name="command">The command, detailing which parameters should be read.</param>
         public DataTable ReadOutput(ReadCommand command)
         {
-            WriteToLog($"Executing {command}");
+            WriteToLog($"Executing {command}", Verbosity.Information);
 
             var stopwatch = Stopwatch.StartNew();
 
@@ -331,20 +435,20 @@ namespace APSIM.Bootstrapper
             using (PortForwardingService service = new PortForwardingService(client))
             {
                 // Start the socket server.
-                WriteToLog($"Initiating port forwarding to job manager...");
+                WriteToLog($"Initiating port forwarding to job manager...", Verbosity.Information);
                 uint socketServerPort = (uint)service.Start(jobManagerPodName, jobNamespace, (int)jobManagerPortNo);
 
                 string ip = "127.0.0.1"; // IPAddress.Loopback
-                WriteToLog($"Initiating connection to job manager...");
+                WriteToLog($"Initiating connection to job manager...", Verbosity.Information);
                 using (var conn = new NetworkSocketClient(options.Verbose, ip, socketServerPort, Protocol.Managed))
                 {
-                    WriteToLog($"Successfully established connection to job manager. Running command...");
+                    WriteToLog($"Successfully established connection to job manager. Running command...", Verbosity.Information);
 
                     // Note - SendCommand will wait for the command to finish.
                     DataTable result = conn.ReadOutput(command);
 
                     stopwatch.Stop();
-                    WriteToLog($"Command executed successfully in {stopwatch.ElapsedMilliseconds}ms. Disconnecting...");
+                    WriteToLog($"Command executed successfully in {stopwatch.ElapsedMilliseconds}ms. Disconnecting...", Verbosity.Information);
 
                     return result;
                 }
@@ -399,7 +503,7 @@ namespace APSIM.Bootstrapper
             }
             catch (OperationCanceledException)
             {
-                WriteToLog($"WARNING: Timeout while waiting for condition {condition.Method.Name} on pod {podName}. Continuing bootstrapper execution...");
+                WriteToLog($"WARNING: Timeout while waiting for condition {condition.Method.Name} on pod {podName}. Continuing bootstrapper execution...", Verbosity.Information);
             }
         }
 
@@ -452,8 +556,20 @@ namespace APSIM.Bootstrapper
             // The container's readiness probe is configured to check if the pod
             // is listening for TCP connections.
             bool ready = status.Ready;
-            WriteToLog($"Container {containerName} in pod {podName} is {(ready ? "" : "not ")}ready.");
+            WriteToLog($"Container {containerName} in pod {podName} is {(ready ? "" : "not ")}ready.", Verbosity.Diagnostic);
             return ready;
+        }
+
+        /// <summary>
+        /// Check if a pod has completed execution.
+        /// </summary>
+        /// <param name="pod">The pod to check.</param>
+        private bool IsFinished(V1Pod pod)
+        {
+            string podName = pod.Name();
+            string containerName = GetContainerName(podName);
+            V1ContainerStatus status = client.GetContainerStatus(pod, containerName);
+            return status?.State?.Terminated != null;
         }
 
         /// <summary>
@@ -467,6 +583,8 @@ namespace APSIM.Bootstrapper
             string podName = pod.Name();
             string containerName = GetContainerName(podName);
             V1ContainerStatus status = client.GetContainerStatus(pod, containerName);
+            if (status == null)
+                return false;
             V1ContainerState state = status.State;
 
             if (state.Terminated != null)
@@ -486,7 +604,7 @@ namespace APSIM.Bootstrapper
         /// Current implementation is to write to stdout iff verbose option is enabled.
         /// </remarks>
         /// <param name="message">Message to be written.</param>
-        private void WriteToLog(string message)
+        protected void WriteToLog(string message, Verbosity verbosity)
         {
             if (options.Verbose)
                 Console.WriteLine(message);
@@ -501,9 +619,16 @@ namespace APSIM.Bootstrapper
         /// <returns></returns>
         private string GetLog(string podNamespace, string podName, string containerName)
         {
-            using (Stream logStream = client.ReadNamespacedPodLog(podName, podNamespace, containerName))
-                using (StreamReader reader = new StreamReader(logStream))
-                    return reader.ReadToEnd();
+            try
+            {
+                using (Stream logStream = client.ReadNamespacedPodLog(podName, podNamespace, containerName))
+                    using (StreamReader reader = new StreamReader(logStream))
+                        return reader.ReadToEnd();
+            }
+            catch (HttpOperationException)
+            {
+                throw;
+            }
         }
 
         /// <summary>
@@ -521,7 +646,7 @@ namespace APSIM.Bootstrapper
         /// </summary>
         private void CreateNamespace()
         {
-            WriteToLog($"Creating namespace {jobNamespace}...");
+            WriteToLog($"Creating namespace {jobNamespace}...", Verbosity.Information);
             try
             {
                 client.CreateNamespace(CreateNamespaceTemplate());
@@ -557,7 +682,7 @@ namespace APSIM.Bootstrapper
         /// </summary>
         private void CreateServiceAccount()
         {
-            WriteToLog($"Creating service account {serviceAccountName}...");
+            WriteToLog($"Creating service account {serviceAccountName}...", Verbosity.Information);
             try
             {
                 client.CreateNamespacedServiceAccount(CreateServiceAccountTemplate(), jobNamespace);
@@ -585,7 +710,7 @@ namespace APSIM.Bootstrapper
         /// </summary>
         private void CreateRole()
         {
-            WriteToLog($"Creating role {roleName}...");
+            WriteToLog($"Creating role {roleName}...", Verbosity.Information);
             try
             {
                 client.CreateNamespacedRole(CreateRoleTemplate(), jobNamespace);
@@ -623,7 +748,7 @@ namespace APSIM.Bootstrapper
         /// </summary>
         private void CreateRoleBinding()
         {
-            WriteToLog("Creating role binding...");
+            WriteToLog("Creating role binding...", Verbosity.Information);
             try
             {
                 client.CreateNamespacedRoleBinding(CreateRoleBindingTemplate(), namespaceParameter: jobNamespace);
@@ -665,7 +790,7 @@ namespace APSIM.Bootstrapper
         {
             try
             {
-                WriteToLog($"Creating job manager pod...");
+                WriteToLog($"Creating job manager pod...", Verbosity.Information);
                 client.CreateNamespacedPod(CreateJobManagerPodTemplate(), jobNamespace);
             }
             catch (Exception err)
@@ -683,6 +808,8 @@ namespace APSIM.Bootstrapper
             V1ObjectMeta metadata = new V1ObjectMeta(name: jobManagerPodName);
             metadata.Labels = new Dictionary<string, string>();
             metadata.Labels["name"] = jobManagerPodName;
+            metadata.Labels[podTypeLabelName] = jobManagerPodType;
+
             string jobNamespace = Guid.NewGuid().ToString();
             // Get the effective file path of the input file in its mounted location
             // (ie as the job manager container will see it).
@@ -690,6 +817,7 @@ namespace APSIM.Bootstrapper
             V1PodSpec spec = new V1PodSpec(
                 containers: new[] { CreateJobManagerContainer(actualInputFile, options.CpuCount) },
                 serviceAccountName: serviceAccountName,
+                affinity: CreateJobManagerAffinity(),
                 restartPolicy: "Never" // If the job manager falls over for some reason, restart it.
                 // In theory, it doesn't really have any longterm state so this should be fine.
             );
@@ -704,7 +832,7 @@ namespace APSIM.Bootstrapper
         private V1Container CreateJobManagerContainer(string inputFile, uint cpuCount)
         {
             string cpuString = cpuCount.ToString(CultureInfo.InvariantCulture);
-            containerArgs = new string[] { "-c", $"until [ -f /start ]; do sleep 1; done; echo File upload complete, starting job manager && /apsim/apsim-server relay --in-pod -vkrmc {cpuString} --namespace {jobNamespace} -f {inputFile} -p {jobManagerPortNo}" };
+            containerArgs = new string[] { "-c", $"until [ -f /start ]; do sleep 1; done; echo File upload complete, starting job manager && /apsim/apsim-server relay --in-pod -vkrnc {cpuString} --namespace {jobNamespace} -f {inputFile} -p {jobManagerPortNo}" };
             return new V1Container(
                 jobManagerContainerName,
                 image: imageName,
@@ -715,13 +843,72 @@ namespace APSIM.Bootstrapper
             );
         }
 
+        public IEnumerable<IPEndPoint> CreateWorkers(ushort numWorkers, string inputFile)
+        {
+            if (workerPodPortNo + numWorkers > ushort.MaxValue)
+                throw new NotSupportedException("TBI: that's a lot of workers. You'll need to modify the code and pick a lower starting port number");
+
+            if (string.IsNullOrEmpty(jobNamespace))
+                throw new InvalidOperationException("Job namespace has not been created. Missing call to Initialise()?");
+
+            string inputsPath = Path.GetDirectoryName(inputFile);
+
+            // Get a list of support files (.met files, .xlsx, ...). These are all
+            // other input files required by the .apsimx file. They are just the
+            // sibling files of the input file.
+            IEnumerable<string> files = Directory.EnumerateFiles(inputsPath, "*", SearchOption.AllDirectories);
+
+            // Don't copy certain file types (.db, .bak, ...).
+            files = files.Where(f => !doNotCopy.Contains(Path.GetExtension(f))).ToArray();
+
+            IDictionary<string, ushort> workerPorts = new Dictionary<string, ushort>();
+            for (ushort i = 0; i < numWorkers; i++)
+            {
+                ushort port = (ushort)(workerPodPortNo + i);
+                string podName = $"worker-{i}";
+                CreateWorkerPod(inputFile, podName, port);
+                workerPorts[podName] = port;
+            }
+
+            // Wait for the pods to start.
+            List<IPEndPoint> workers = new List<IPEndPoint>(numWorkers);
+            ParallelOptions options = new ParallelOptions();
+            options.MaxDegreeOfParallelism = Environment.ProcessorCount;
+            Parallel.ForEach(workerPorts, options, pair =>
+            {
+                string podName = pair.Key;
+                ushort port = pair.Value;
+
+                CancellationTokenSource cts = new CancellationTokenSource(60 * 1000);
+                WriteToLog($"Waiting for {podName} to start...", Verbosity.Information);
+                WaitFor(podName, HasStarted, cts);
+
+                // After each pod has started, copy the input files into that pod
+                // and send the start signal so it will start listening.
+                SendFilesToPod(podName, files, workerInputsPath);
+                SendStartSignalToPod(podName);
+
+                string ipAddress = GetPodIPAddress(podName);
+                workers.Add(new IPEndPoint(IPAddress.Parse(ipAddress), port));
+            });
+
+            foreach ((string podName, _) in workerPorts)
+            {
+                CancellationTokenSource cts = new CancellationTokenSource(60 * 1000);
+                WriteToLog($"Waiting for {podName} to become ready...", Verbosity.Information);
+                WaitFor(podName, IsReady, cts);
+            }
+
+            return workers;
+        }
+
         /// <summary>
         /// Initialise the worker nodes.
         /// </summary>
         /// <param name="client">The kubernetes client to be used.</param>
         private void CreateWorkers()
         {
-            WriteToLog("Initialising workers...");
+            WriteToLog("Initialising workers...", Verbosity.Information);
 
             // Split apsimx file into smaller chunks.
             string inputsPath = Path.GetDirectoryName(options.InputFile);
@@ -733,16 +920,16 @@ namespace APSIM.Bootstrapper
             supportFiles = supportFiles.Where(f => !doNotCopy.Contains(Path.GetExtension(f)));
             string tempDir = Path.Combine(Path.GetTempPath(), $"apsim-cluster-job-chunked-inputs-{jobNamespace}");
             Directory.CreateDirectory(tempDir);
-            IEnumerable<string> generatedFiles = SplitApsimXFile(options.InputFile, 1, tempDir); // todo : extact this to be a user parameter
+            IEnumerable<string> generatedFiles = SplitApsimXFile(options.InputFile, chunkSize, tempDir); // todo : extact this to be a user parameter
             if (generatedFiles.Any())
             {
                 int n = generatedFiles.Count();
-                WriteToLog($"Split input file into {n} chunk{(n == 1 ? "" : "s")}.");
+                WriteToLog($"Split input file into {n} chunk{(n == 1 ? "" : "s")}.", Verbosity.Information);
             }
             else
                 throw new InvalidOperationException($"Input file {options.InputFile} contains no simulations.");
 
-            WriteToLog("Launching pods...");
+            WriteToLog("Launching pods...", Verbosity.Information);
 
             // Create pod templates.
             uint i = 0;
@@ -751,13 +938,13 @@ namespace APSIM.Bootstrapper
             {
                 string podName = $"worker-{i++}";
                 pods.Add(podName, file);
-                CreateWorkerPod(file, podName);
+                CreateWorkerPod(file, podName, workerPodPortNo);
             }
             workers = pods.Select(k => k.Key).ToArray();
-            WriteToLog($"Successfully created {pods.Count} pod{(pods.Count == 1 ? "" : "s")}.");
+            WriteToLog($"Successfully created {pods.Count} pod{(pods.Count == 1 ? "" : "s")}.", Verbosity.Information);
 
             // Wait for worker containers to launch.
-            WriteToLog($"Waiting for pods to start...");
+            WriteToLog($"Waiting for pods to start...", Verbosity.Information);
             CancellationTokenSource cts = new CancellationTokenSource(10 * 1000);
             foreach (string worker in workers)
                 WaitFor(worker, HasStarted, cts);
@@ -766,7 +953,7 @@ namespace APSIM.Bootstrapper
             // The keys here are the pod names
             // The values are the pod's input file.
             // todo: create a struct to hold this?
-            WriteToLog("Sending input files to pods...");
+            WriteToLog("Sending input files to pods...", Verbosity.Information);
             foreach (KeyValuePair<string, string> pod in pods)
             {
                 SendFilesToPod(pod.Key, supportFiles.Append(pod.Value), workerInputsPath);
@@ -794,11 +981,11 @@ namespace APSIM.Bootstrapper
         /// </summary>
         /// <param name="file">Input file for the pod.</param>
         /// <param name="podName">Name of the worker pod.</param>
-        private void CreateWorkerPod(string file, string podName)
+        private void CreateWorkerPod(string file, string podName, uint portNo)
         {
-            V1Pod template = CreateWorkerPodTemplate(file, podName);
+            V1Pod template = CreateWorkerPodTemplate(file, podName, portNo);
             client.CreateNamespacedPod(template, jobNamespace);
-            WriteToLog($"Successfully launched pod {podName}.");
+            WriteToLog($"Successfully launched pod {podName}.", Verbosity.Information);
         }
 
         /// <summary>
@@ -807,15 +994,221 @@ namespace APSIM.Bootstrapper
         /// <param name="file">The .apsimx file which the pod should run.</param>
         /// <param name="supportFiles">Other misc input files (e.g. met file) which are required to run the main .apsimx file.</param>
         /// <param name="workerCpuCount">The number of vCPUs for the worker container in the pod. This should probably be equal to the number of simulations in the .apsimx file.</param>
-        private V1Pod CreateWorkerPodTemplate(string file, string podName)
+        private V1Pod CreateWorkerPodTemplate(string file, string podName, uint portNo)
         {
             // todo: pod labels
             V1ObjectMeta metadata = new V1ObjectMeta(name: podName);
+            metadata.Labels = new Dictionary<string, string>();
+            metadata.Labels[podTypeLabelName] = workerPodType;
+
             V1PodSpec spec = new V1PodSpec()
             {
-                Containers = new[] { CreateWorkerContainerTemplate(GetContainerName(podName), file) }
+                Containers = new[] { CreateWorkerContainerTemplate(GetContainerName(podName), file, portNo) },
+                RestartPolicy = "Never",
+                Affinity = CreateWorkerAffinity(),
+                TopologySpreadConstraints = new V1TopologySpreadConstraint[]
+                {
+                    EvenlyDistributeWorkers()
+                }
             };
             return new V1Pod(apiVersion, metadata: metadata, spec: spec);
+        }
+
+        /// <summary>
+        /// Create a pod topology spread constraint which ensures that worker pods
+        /// scheduled as evenly as possible across the available worker nodes.
+        /// 
+        /// That is, that any worker node has at most 1 more or 1 less worker pod
+        /// than any other worker node.
+        /// </summary>
+        private V1TopologySpreadConstraint EvenlyDistributeWorkers()
+        {
+            return new V1TopologySpreadConstraint()
+            {
+                MaxSkew = 1,
+                TopologyKey = kubernetesNodeNameLabel,
+                // If the constraint cannot be scheduled, the pod will be scheduled
+                // anyway, and the scheduler will give higher priority to nodes
+                // which would help reduce the skew/spread.
+                WhenUnsatisfiable = scheduleAnyway,
+                LabelSelector = WorkerPods()
+            };
+        }
+
+        /// <summary>
+        /// Create an affinity which prevents a pod from being scheduled
+        /// on one of the cluster 'master' nodes (if in an openstack cluster),
+        /// and also prevents the pod from being scheduled on any node which is already
+        /// running a worker, job manager, or optimiser pod, to ensure that the pods
+        /// aren't competing for resources.
+        /// </summary>
+        private V1Affinity CreateWorkerAffinity()
+        {
+            return new V1Affinity()
+            {
+                NodeAffinity = new V1NodeAffinity()
+                {
+                    RequiredDuringSchedulingIgnoredDuringExecution = new V1NodeSelector()
+                    {
+                        NodeSelectorTerms = new[]
+                        {
+                            AvoidMasterNodes(),
+                            AvoidJobManagerNodes(true),
+                            PreferWorkerNodes(true),
+                        }
+                    },
+                },
+                // Don't need this anymore - we're using a spread topology constraint instead.
+                // PodAntiAffinity = CreatePodAntiAffinity(workerPodType, jobManagerPodType, optimiserPodType)
+            };
+        }
+
+        /// <summary>
+        /// Create an affinity to be used for a job manager pod. This affinity will
+        /// prevent the pod from being scheduled on a master node, and will cause
+        /// the pod scheduler to "prefer" that the pod be run on a job manager pod
+        /// (if any exist).
+        /// </summary>
+        private V1Affinity CreateJobManagerAffinity()
+        {
+            return new V1Affinity()
+            {
+                NodeAffinity = new V1NodeAffinity()
+                {
+                    RequiredDuringSchedulingIgnoredDuringExecution = new V1NodeSelector()
+                    {
+                        NodeSelectorTerms = new[]
+                        {
+                            AvoidMasterNodes(),
+                        }
+                    },
+                    PreferredDuringSchedulingIgnoredDuringExecution = new[]
+                    {
+                        new V1PreferredSchedulingTerm(AvoidJobManagerNodes(false), 100)
+                    }
+                },
+                PodAntiAffinity = CreatePodAntiAffinity(workerPodType, jobManagerPodType, optimiserPodType)
+            };
+        }
+
+        /// <summary>
+        /// Create a node selector which prefers worker nodes (or avoids
+        /// worker nodes if prefer is set to false).
+        /// </summary>
+        /// <param name="prefer">Prefer (T) or avoid (F) worker nodes?</param>
+        private V1NodeSelectorTerm PreferWorkerNodes(bool prefer)
+        {
+            return new V1NodeSelectorTerm()
+            {
+                MatchExpressions = new[]
+                {
+                    new V1NodeSelectorRequirement()
+                    {
+                        Key = openStackNodeRoleLabelName,
+                        OperatorProperty = notIn,
+                        Values = new[] { openStackWorkerNodeRoleName }
+                    }
+                }
+            };
+        }
+
+        /// <summary>
+        /// Create a node affinity which will either avoid or prefer all master nodes
+        /// on magnum (openstack) clusters.
+        /// </summary>
+        /// <remarks>
+        /// This is only applicable for openstack cluters (ie Nectar), but it will
+        /// have no effect (good or bad) on other clusters, as the label we check for
+        /// should not exist on any nodes on other clusters.
+        /// </remarks>
+        private V1NodeSelectorTerm AvoidMasterNodes()
+        {
+            return new V1NodeSelectorTerm()
+            {
+                MatchExpressions = new[]
+                {
+                    new V1NodeSelectorRequirement()
+                    {
+                        Key = openStackNodeRoleLabelName,
+                        OperatorProperty = notIn,
+                        Values = new[] { openStackMasterNodeRole }
+                    }
+                }
+            };
+        }
+
+        /// <summary>
+        /// Create a node selector which either prefers or avoids job manager nodes.
+        /// </summary>
+        /// <param name="avoid">
+        /// If set to true, the resultant affinity will prefer nodes which /are not/ master
+        /// nodes. If set to false, the resultant affinity will prefer nodes which /are/
+        /// master nodes.
+        /// </param>
+        private V1NodeSelectorTerm AvoidJobManagerNodes(bool avoid)
+        {
+            return new V1NodeSelectorTerm()
+            {
+                MatchExpressions = new[]
+                {
+                    new V1NodeSelectorRequirement()
+                    {
+                        Key = openStackNodeRoleLabelName,
+                        OperatorProperty = avoid ? notIn : @in,
+                        Values = new[] { openStackJobManagerNodeRole }
+                    }
+                }
+            };
+        }
+
+        /// <summary>
+        /// Create a pod affinity which prevents a pod from being run on a node
+        /// if any pods of the given pod types are already running on that node.
+        /// </summary>
+        /// <param name="podTypes">The pod types to avoid.</param>
+        /// <remarks>
+        /// https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#inter-pod-affinity-and-anti-affinity
+        /// </remarks>
+        private V1PodAntiAffinity CreatePodAntiAffinity(params string[] podTypes)
+        {
+            return new V1PodAntiAffinity()
+            {
+                RequiredDuringSchedulingIgnoredDuringExecution = new[]
+                {
+                    new V1PodAffinityTerm()
+                    {
+                        LabelSelector = new V1LabelSelector()
+                        {
+                            MatchExpressions = new[]
+                            {
+                                new V1LabelSelectorRequirement()
+                                {
+                                    Key = podTypeLabelName,
+                                    OperatorProperty = @in,
+                                    Values = podTypes
+                                }
+                            }
+                        },
+                        TopologyKey = kubernetesNodeNameLabel
+                    }
+                }
+            };
+        }
+
+        private V1LabelSelector WorkerPods()
+        {
+            return new V1LabelSelector()
+            {
+                MatchExpressions = new[]
+                {
+                    new V1LabelSelectorRequirement()
+                    {
+                        Key = podTypeLabelName,
+                        OperatorProperty = @in,
+                        Values = new[] { workerPodType }
+                    }
+                }
+            };
         }
 
         /// <summary>
@@ -823,7 +1216,7 @@ namespace APSIM.Bootstrapper
         /// </summary>
         /// <param name="name">Display name for the container.</parama>
         /// <param name="file">The input file on which the container should run.</param>
-        private V1Container CreateWorkerContainerTemplate(string name, string file)
+        private V1Container CreateWorkerContainerTemplate(string name, string file, uint portNo)
         {
             string fileName = Path.GetFileName(file);
             // fixme - this is hacky and nasty
@@ -832,7 +1225,7 @@ namespace APSIM.Bootstrapper
                 "-c",
                 // todo: extract port # to user param
                 // todo: use pod's internal IP address rather than 0.0.0.0
-                $"mkdir -p {workerInputsPath} && until [ -f {containerStartFile} ]; do sleep 1; done; echo File upload complete, starting server && /apsim/apsim-server listen -vkrmf {workerInputsPath}/{fileName} -a 0.0.0.0 -p {workerNodePortNo}"
+                $"mkdir -p {workerInputsPath} && until [ -f {containerStartFile} ]; do sleep 1; done; echo File upload complete, starting server && /apsim/apsim-server listen -vkrmf {workerInputsPath}/{fileName} -a 0.0.0.0 -p {portNo}"
             };
 
             return new V1Container(
@@ -840,8 +1233,8 @@ namespace APSIM.Bootstrapper
                 image: imageName,
                 command: new string[] { "/bin/sh" },
                 args: args,
-                imagePullPolicy: "Always",
-                readinessProbe: CreateReadinessProbe(workerNodePortNo)
+                imagePullPolicy: ifNotPresent,
+                readinessProbe: CreateReadinessProbe(portNo)
             );
         }
 
@@ -877,10 +1270,9 @@ namespace APSIM.Bootstrapper
         /// <param name="destinationDirectory">Directory on the pod into which the files will be copied.</param>
         private void SendFilesToPod(string podName, IEnumerable<string> files, string destinationDirectory)
         {
-            WriteToLog($"Sending inputs to pod {podName}...");
             foreach (string file in files)
             {
-                WriteToLog($"Sending input file {file} to pod {podName}...");
+                WriteToLog($"Sending {file} to {podName}...", Verbosity.Information);
                 V1Pod pod = GetPod(podName);
                 string destination = $"{destinationDirectory}/{Path.GetFileName(file)}";
                 client.CopyFileToPod(pod, GetContainerName(podName), file, destination);
@@ -904,7 +1296,25 @@ namespace APSIM.Bootstrapper
         /// <param name="podName">Name of the worker pod.</param>
         private V1Pod GetPod(string podName)
         {
-            return client.ReadNamespacedPod(podName, jobNamespace);
+            try
+            {
+                return client.ReadNamespacedPod(podName, jobNamespace);
+            }
+            catch (System.Net.Http.HttpRequestException)
+            {
+                int numTries = 3;
+                for (uint i = 0; i < numTries; i++)
+                {
+                    try
+                    {
+                        return client.ReadNamespacedPod(podName, jobNamespace);
+                    }
+                    catch
+                    {
+                    }
+                }
+                throw;
+            }
         }
 
         /// <summary>
@@ -920,7 +1330,7 @@ namespace APSIM.Bootstrapper
         private void SendStartSignalToPod(string podName)
         {
             // fixme
-            WriteToLog($"Sending start signal to pod {podName}...");
+            WriteToLog($"Sending start signal to {podName}...", Verbosity.Information);
             string file = Path.GetTempFileName();
             using (File.Create(file)) { }
             V1Pod pod = GetPod(podName);

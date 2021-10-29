@@ -3,10 +3,12 @@ using System.Collections.Generic;
 using System.Data;
 using System.Diagnostics;
 using System.IO;
+using System.Net;
 using System.Text;
 using APSIM.Server.Commands;
 using APSIM.Shared.Utilities;
 using CommandLine;
+using Microsoft.Rest;
 using Models.Core.Run;
 
 namespace APSIM.Bootstrapper
@@ -34,50 +36,54 @@ namespace APSIM.Bootstrapper
         /// <param name="options">Options</param>
         private static void Run(Options options)
         {
-            Bootstrapper bootstrapper = null;
             try
             {
-                bootstrapper = new Bootstrapper(options);
-
-                // 1. Initialise the job.
-                bootstrapper.Initialise();
-
-                // Let's do this bit twice, just for fun.
-                for (int i = 0; i < 2; i++)
+                using (Bootstrapper bootstrapper = new Bootstrapper(options))
                 {
-                    // 2. Run everything.
-                    RunCommand command = new RunCommand(new IReplacement[0]);
-                    bootstrapper.RunWithChanges(command);
 
-                    // 3. Read outputs.
-                    IEnumerable<string> parameters = new[]
-                    {
-                        "Date",
-                        "BiomassWt",
-                        "Yield"
-                    };
-                    ReadCommand readCommand = new ReadCommand("Report", parameters);
-                    DataTable outputs = bootstrapper.ReadOutput(readCommand);
-                    Console.WriteLine("Received output from cluster:");
-                    Console.WriteLine(DataTableUtilities.ToMarkdown(outputs, true));
+                    // 1. Initialise the job.
+                    bootstrapper.Initialise();
+
+                    // Create some workers as a test.
+                    IEnumerable<IPEndPoint> workers = bootstrapper.CreateWorkers(80, options.InputFile);
+
+                    // bootstrapper.CreateDefaultSetup();
+
+                    
+                    // // Let's do this bit twice, just for fun.
+                    // for (int i = 0; i < 2; i++)
+                    // {
+                    //     // 2. Run everything.
+                    //     RunCommand command = new RunCommand(new IReplacement[0]);
+                    //     bootstrapper.RunWithChanges(command);
+
+                    //     // 3. Read outputs.
+                    //     IEnumerable<string> parameters = new[]
+                    //     {
+                    //         "Date",
+                    //         "BiomassWt",
+                    //         "Yield"
+                    //     };
+                    //     ReadCommand readCommand = new ReadCommand("Report", parameters);
+                    //     DataTable outputs = bootstrapper.ReadOutput(readCommand);
+                    //     Console.WriteLine("Received output from cluster:");
+                    //     Console.WriteLine(DataTableUtilities.ToMarkdown(outputs, true));
+                    // }
+
+                    // next - test rerunning with changed inputs - should cause changed outputs
+                    // bootstrapper.RunWithChanges(command);
+
+                    // TestCopyFile.TestCompressToProcess();
+
+                    // MoreTests.Run();
                 }
-
-                // 4. Cleanup all provisioned resources.
-                bootstrapper.Dispose();
-
-                // next - test rerunning with changed inputs - should cause changed outputs
-                // bootstrapper.RunWithChanges(command);
-
-                // TestCopyFile.TestCompressToProcess();
-
-                // MoreTests.Run();
             }
             catch (Exception err)
             {
                 Console.Error.WriteLine(err);
+                if (err is HttpOperationException httpError)
+                    Console.Error.WriteLine(httpError.Response.Content);
                 exitCode = 1;
-                if (bootstrapper != null)
-                    bootstrapper.Dispose();
             }
         }
 
