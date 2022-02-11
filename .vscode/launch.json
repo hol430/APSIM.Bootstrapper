@@ -12,7 +12,7 @@
             "program": "${workspaceFolder}/src/bin/Debug/net5.0/APSIM.Bootstrapper.dll",
             "args": [
                 "-vf",
-                "${workspaceFolder}/examples/sorghum-single-sim.apsimx"
+                "${workspaceFolder}/examples/single/sorghum-single-sim.apsimx"
             ],
             "cwd": "${workspaceFolder}",
             "console": "internalConsole",
