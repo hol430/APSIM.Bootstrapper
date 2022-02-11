@@ -44,31 +44,35 @@ namespace APSIM.Bootstrapper
                     // 1. Initialise the job.
                     bootstrapper.Initialise();
 
-                    // Create some workers as a test.
-                    IEnumerable<IPEndPoint> workers = bootstrapper.CreateWorkers(80, options.InputFile);
+                    // Create the job manager.
+                    bootstrapper.CreateJobManager();
 
+                    // Create some workers as a test.
+                    IEnumerable<IPEndPoint> workers = bootstrapper.CreateWorkers(5, options.InputFile);
+
+                    bootstrapper.StartJobmanager();
                     // bootstrapper.CreateDefaultSetup();
 
                     
-                    // // Let's do this bit twice, just for fun.
-                    // for (int i = 0; i < 2; i++)
-                    // {
-                    //     // 2. Run everything.
-                    //     RunCommand command = new RunCommand(new IReplacement[0]);
-                    //     bootstrapper.RunWithChanges(command);
+                    // Let's do this bit twice, just for fun.
+                    for (int i = 0; i < 2; i++)
+                    {
+                        // 2. Run everything.
+                        RunCommand command = new RunCommand(new IReplacement[0]);
+                        bootstrapper.RunWithChanges(command);
 
-                    //     // 3. Read outputs.
-                    //     IEnumerable<string> parameters = new[]
-                    //     {
-                    //         "Date",
-                    //         "BiomassWt",
-                    //         "Yield"
-                    //     };
-                    //     ReadCommand readCommand = new ReadCommand("Report", parameters);
-                    //     DataTable outputs = bootstrapper.ReadOutput(readCommand);
-                    //     Console.WriteLine("Received output from cluster:");
-                    //     Console.WriteLine(DataTableUtilities.ToMarkdown(outputs, true));
-                    // }
+                        // 3. Read outputs.
+                        IEnumerable<string> parameters = new[]
+                        {
+                            "Date",
+                            "BiomassWt",
+                            "Yield"
+                        };
+                        ReadCommand readCommand = new ReadCommand("Report", parameters);
+                        DataTable outputs = bootstrapper.ReadOutput(readCommand);
+                        Console.WriteLine("Received output from cluster:");
+                        Console.WriteLine(DataTableUtilities.ToMarkdown(outputs, true));
+                    }
 
                     // next - test rerunning with changed inputs - should cause changed outputs
                     // bootstrapper.RunWithChanges(command);

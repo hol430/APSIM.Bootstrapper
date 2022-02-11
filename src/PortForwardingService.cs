@@ -24,12 +24,12 @@ namespace APSIM.Bootstrapper
         /// Cancellation token which is registered to the socket server.
         /// Cancel this to cancel the socket server.
         /// </summary>
-        private CancellationTokenSource cts;
+        private readonly CancellationTokenSource cts;
 
         /// <summary>
         /// Client used to make kubernetes API requests.
         /// </summary>
-        private IKubernetes client;
+        private readonly IKubernetes client;
 
         /// <summary>
         /// The port forwarding (socket server) task.

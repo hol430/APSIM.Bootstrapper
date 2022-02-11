@@ -90,7 +90,7 @@ namespace APSIM.Bootstrapper
         /// Using bash for now to facilitate a hack to wait until files are
         /// copied into the container before starting the job manager.
         /// </remarks>
-        private const string containerEntrypoint = "/bin/bash";//"/apsim/apsim-server";
+        private const string containerEntrypoint = "/bin/bash";//"apsim-server";
 
         /// <summary>
         /// The name of the service account created for and used by the job manager.
@@ -113,7 +113,14 @@ namespace APSIM.Bootstrapper
         /// <summary>
         /// A label with this name is added to all pods created by the bootstrapper.
         /// </summary>
-        private const string podTypeLabelName = "dev.apsim.info/pod-type";
+        private const string podTypeLabelName = "k8s.apsim.info/pod-type";
+
+        /// <summary>
+        /// A label with this name is added to all pods created by the
+        /// bootstrapper. The value of this label indicates the TCP port on
+        /// which the server in the pod is listening for connections.
+        /// </summary>
+        private const string podPortNoLabelName = "k8s.apsim.info/port-no";
 
         /// <summary>
         /// All worker pods have their <see cref="podTypeLabelName"/> set to this value.
@@ -319,63 +326,6 @@ namespace APSIM.Bootstrapper
         }
 
         /// <summary>
-        /// Run the bootstrapper - initialise the cluster environment.
-        /// </summary>
-        internal void CreateDefaultSetup()
-        {
-            try
-            {
-                // Create a service account for the job manager pod.
-                CreateServiceAccount();
-
-                // Create the Role which will be linked to the servicea account.
-                // This role will give the job manager the necessary permissions
-                // to create and manage its worker pods.
-                CreateRole();
-
-                // Create a RoleBinding, linking the role to the service account.
-                CreateRoleBinding();
-
-                // Create the job manager pod.
-                CreateJobManager();
-
-                // Create worker pods.
-                CreateWorkers();
-
-                // Wait for the job manager pod to finish creation/startup.
-                WriteToLog("Waiting for job manager pod to start...", Verbosity.Information);
-                CancellationTokenSource cts = new CancellationTokenSource(100 * 1000);
-                WaitFor(jobManagerPodName, HasStarted, cts);
-
-                // Send the start signal to the job manager pod.
-                // This will start the apsim server.
-                SendStartSignalToPod(jobManagerPodName);
-
-                // Wait for the apsim server to complete its initialisation.
-                WriteToLog("Waiting for job manager pod to enter ready state...", Verbosity.Information);
-                WaitFor(jobManagerPodName, IsReady, cts);
-
-                WriteToLog("Waiting for worker nodes to enter ready state...", Verbosity.Information);
-                foreach (string worker in workers)
-                    WaitFor(worker, IsReady, cts);
-            }
-            catch (HttpOperationException httpError)
-            {
-                // If we encounter any errors while setting up the job manager pod
-                // or its resources, attempt to delete the namespace. Any created
-                // resources will be inside this namespace and will be deleted along
-                // with the namespace.
-                Dispose();
-                throw new BootstrapperException(httpError);
-            }
-            catch
-            {
-                Dispose();
-                throw;
-            }
-        }
-
-        /// <summary>
         /// Get the IP Address of a pod.
         /// </summary>
         /// <param name="podName">Name of the pod.</param>
@@ -468,7 +418,7 @@ namespace APSIM.Bootstrapper
             try
             {
                 try
-                {
+                { 
                     client.DeleteNamespace(jobNamespace);
                 }
                 catch (HttpOperationException httpError)
@@ -496,6 +446,8 @@ namespace APSIM.Bootstrapper
         {
             try
             {
+                if (string.IsNullOrEmpty(podName))
+                    throw new ArgumentNullException(nameof(podName));
                 Task waiter = WaitForAsync(podName, condition, cancelToken.Token);
                 waiter.Wait(cancelToken.Token);
                 if (waiter.Status == TaskStatus.Faulted)
@@ -514,6 +466,8 @@ namespace APSIM.Bootstrapper
         /// <param name="condition">Condition for which to wait.</param>
         private async Task WaitForAsync(string podName, Func<V1Pod, bool> condition, CancellationToken cancelToken)
         {
+            if (string.IsNullOrEmpty(podName))
+                throw new ArgumentNullException(nameof(podName));
             bool conditionMet = false;
             Action<WatchEventType, V1Pod> onEvent = (_, pod) => { conditionMet = condition(pod); };
             Action<Exception> errorHandler = e => { if (!conditionMet) throw e; };
@@ -619,16 +573,9 @@ namespace APSIM.Bootstrapper
         /// <returns></returns>
         private string GetLog(string podNamespace, string podName, string containerName)
         {
-            try
-            {
-                using (Stream logStream = client.ReadNamespacedPodLog(podName, podNamespace, containerName))
-                    using (StreamReader reader = new StreamReader(logStream))
-                        return reader.ReadToEnd();
-            }
-            catch (HttpOperationException)
-            {
-                throw;
-            }
+            using (Stream logStream = client.ReadNamespacedPodLog(podName, podNamespace, containerName))
+                using (StreamReader reader = new StreamReader(logStream))
+                    return reader.ReadToEnd();
         }
 
         /// <summary>
@@ -678,6 +625,48 @@ namespace APSIM.Bootstrapper
         }
 
         /// <summary>
+        /// Create and launch the job manager pod, and return the created
+        /// pod object.
+        /// </summary>
+        public void CreateJobManager()
+        {
+            try
+            {
+                // Create a service account for the job manager pod.
+                CreateServiceAccount();
+
+                // Create the role which will be linked to the service account.
+                // This rolw eill give the job manager the necessary permissions
+                // to create and manage its worker pods.
+                CreateRole();
+
+                // Create a RoleBinding, linking the role to the service account.
+                CreateRoleBinding();
+
+                WriteToLog($"Creating job manager pod...", Verbosity.Information);
+                client.CreateNamespacedPod(CreateJobManagerPodTemplate(), jobNamespace);
+            }
+            catch (Exception err)
+            {
+                throw new BootstrapperException("Unable to create job manager pod", err);
+            }
+        }
+
+        /// <summary>
+        /// Start the job manager pod. This will cause the job manager to
+        /// discover all of its worker nodes and start listening for
+        /// connections. Therefore, this should not be called until after the
+        /// worker nodes have been created.
+        /// </summary>
+        public void StartJobmanager()
+        {
+            CancellationTokenSource cts = new CancellationTokenSource(20 * 1000);
+            WaitFor(jobManagerPodName, HasStarted, cts);
+            SendStartSignalToPod(jobManagerPodName);
+            WaitFor(jobManagerPodName, IsReady, cts);
+        }
+
+        /// <summary>
         /// Create the necessary service account for the job manager.
         /// </summary>
         private void CreateServiceAccount()
@@ -705,9 +694,6 @@ namespace APSIM.Bootstrapper
             );
         }
 
-        /// <summary>
-        /// Create the kubernetes role to be used by the job manager's service account.
-        /// </summary>
         private void CreateRole()
         {
             WriteToLog($"Creating role {roleName}...", Verbosity.Information);
@@ -783,23 +769,6 @@ namespace APSIM.Bootstrapper
         }
 
         /// <summary>
-        /// Create and launch the job manager pod, and return the created
-        /// pod object.
-        /// </summary>
-        private void CreateJobManager()
-        {
-            try
-            {
-                WriteToLog($"Creating job manager pod...", Verbosity.Information);
-                client.CreateNamespacedPod(CreateJobManagerPodTemplate(), jobNamespace);
-            }
-            catch (Exception err)
-            {
-                throw new BootstrapperException("Unable to create job manager pod", err);
-            }
-        }
-
-        /// <summary>
         /// Instantiate a pod object which will run a single container (the job manager).
         /// This function does not launch the pod with the kubernetes API.
         /// </summary>
@@ -832,17 +801,25 @@ namespace APSIM.Bootstrapper
         private V1Container CreateJobManagerContainer(string inputFile, uint cpuCount)
         {
             string cpuString = cpuCount.ToString(CultureInfo.InvariantCulture);
-            containerArgs = new string[] { "-c", $"until [ -f /start ]; do sleep 1; done; echo File upload complete, starting job manager && /apsim/apsim-server relay --in-pod -vkrnc {cpuString} --namespace {jobNamespace} -f {inputFile} -p {jobManagerPortNo}" };
+            containerArgs = new string[] { "-c", $"until [ -f /start ]; do sleep 1; done; echo File upload complete, starting job manager && apsim-server relay --in-pod -vkrmc {cpuString} --namespace {jobNamespace} -f {inputFile} -p {jobManagerPortNo} --backlog 3" };
             return new V1Container(
                 jobManagerContainerName,
                 image: imageName,
                 command: new[] { containerEntrypoint },
                 args: containerArgs,
-                imagePullPolicy: "Always",
+                imagePullPolicy: ifNotPresent,
                 readinessProbe: CreateReadinessProbe(jobManagerPortNo)
             );
         }
 
+        /// <summary>
+        /// Create a given number of worker pods. The workers will be evenly distributed
+        /// across all worker nodes in the cluster. Each worker runs an apsim server
+        /// instance and will be listening on a unique port number. The return value will
+        /// be the IP address endpoints of the created workers.
+        /// </summary>
+        /// <param name="numWorkers">Number of workers to create.</param>
+        /// <param name="inputFile">The input file.</param>
         public IEnumerable<IPEndPoint> CreateWorkers(ushort numWorkers, string inputFile)
         {
             if (workerPodPortNo + numWorkers > ushort.MaxValue)
@@ -860,120 +837,63 @@ namespace APSIM.Bootstrapper
 
             // Don't copy certain file types (.db, .bak, ...).
             files = files.Where(f => !doNotCopy.Contains(Path.GetExtension(f))).ToArray();
+            int numFiles = files.Count();
 
+            ParallelOptions parallelism = new ParallelOptions();
+            parallelism.MaxDegreeOfParallelism = Environment.ProcessorCount;
+
+            // 1. Create worker pods.
             IDictionary<string, ushort> workerPorts = new Dictionary<string, ushort>();
-            for (ushort i = 0; i < numWorkers; i++)
+            Parallel.For(0, numWorkers, parallelism, i =>
             {
                 ushort port = (ushort)(workerPodPortNo + i);
                 string podName = $"worker-{i}";
                 CreateWorkerPod(inputFile, podName, port);
-                workerPorts[podName] = port;
-            }
+                lock (workerPorts)
+                    workerPorts[podName] = port;
+            });
 
-            // Wait for the pods to start.
+            // 2. Wait for the pods to start, then upload input files.
             List<IPEndPoint> workers = new List<IPEndPoint>(numWorkers);
-            ParallelOptions options = new ParallelOptions();
-            options.MaxDegreeOfParallelism = Environment.ProcessorCount;
-            Parallel.ForEach(workerPorts, options, pair =>
+            Parallel.ForEach(workerPorts, parallelism, pair =>
             {
                 string podName = pair.Key;
                 ushort port = pair.Value;
 
-                CancellationTokenSource cts = new CancellationTokenSource(60 * 1000);
+                // Wait up to 30s for each pod to start. This is pretty generous.
+                int timeToWait = 30; // in seconds
+                CancellationTokenSource cts = new CancellationTokenSource(timeToWait * 1000);
                 WriteToLog($"Waiting for {podName} to start...", Verbosity.Information);
                 WaitFor(podName, HasStarted, cts);
 
-                // After each pod has started, copy the input files into that pod
-                // and send the start signal so it will start listening.
+                // After each pod has started, copy the input files into the pod.
                 SendFilesToPod(podName, files, workerInputsPath);
+
+                // Finally, send the start signal to the pod. This will cause the
+                // apsim server to start listening for connections.
                 SendStartSignalToPod(podName);
 
+                // Store the pod's allocated IP address for later use.
                 string ipAddress = GetPodIPAddress(podName);
+                if (string.IsNullOrEmpty(ipAddress))
+                    throw new Exception($"Unable to fetch IP address for pod {podName}");
                 workers.Add(new IPEndPoint(IPAddress.Parse(ipAddress), port));
             });
 
-            foreach ((string podName, _) in workerPorts)
+            // 3. Wait for all pods to enter the "ready" state. We've defined a
+            //    custom readiness probe which attempts a TCP connection on the
+            //    port on which the pod's apsim server is listening.
+            Parallel.ForEach(workerPorts.Select(w => w.Key), parallelism, podName =>
             {
-                CancellationTokenSource cts = new CancellationTokenSource(60 * 1000);
+                // Allow up to 5 seconds for the pod to become ready. This should be
+                // plenty of time if the number of workers is high.
+                int timeToWait = 5; // in seconds
+                CancellationTokenSource cts = new CancellationTokenSource(timeToWait * 1000);
                 WriteToLog($"Waiting for {podName} to become ready...", Verbosity.Information);
                 WaitFor(podName, IsReady, cts);
-            }
+            });
 
             return workers;
-        }
-
-        /// <summary>
-        /// Initialise the worker nodes.
-        /// </summary>
-        /// <param name="client">The kubernetes client to be used.</param>
-        private void CreateWorkers()
-        {
-            WriteToLog("Initialising workers...", Verbosity.Information);
-
-            // Split apsimx file into smaller chunks.
-            string inputsPath = Path.GetDirectoryName(options.InputFile);
-
-            // Get a list of support files (.met files, .xlsx, ...). These are all
-            // other input files required by the .apsimx file. They are just the
-            // sibling files of the input file.
-            IEnumerable<string> supportFiles = Directory.EnumerateFiles(inputsPath, "*", SearchOption.AllDirectories).Except(new[] { options.InputFile });
-            supportFiles = supportFiles.Where(f => !doNotCopy.Contains(Path.GetExtension(f)));
-            string tempDir = Path.Combine(Path.GetTempPath(), $"apsim-cluster-job-chunked-inputs-{jobNamespace}");
-            Directory.CreateDirectory(tempDir);
-            IEnumerable<string> generatedFiles = SplitApsimXFile(options.InputFile, chunkSize, tempDir); // todo : extact this to be a user parameter
-            if (generatedFiles.Any())
-            {
-                int n = generatedFiles.Count();
-                WriteToLog($"Split input file into {n} chunk{(n == 1 ? "" : "s")}.", Verbosity.Information);
-            }
-            else
-                throw new InvalidOperationException($"Input file {options.InputFile} contains no simulations.");
-
-            WriteToLog("Launching pods...", Verbosity.Information);
-
-            // Create pod templates.
-            uint i = 0;
-            Dictionary<string, string> pods = new Dictionary<string, string>();
-            foreach (string file in generatedFiles)
-            {
-                string podName = $"worker-{i++}";
-                pods.Add(podName, file);
-                CreateWorkerPod(file, podName, workerPodPortNo);
-            }
-            workers = pods.Select(k => k.Key).ToArray();
-            WriteToLog($"Successfully created {pods.Count} pod{(pods.Count == 1 ? "" : "s")}.", Verbosity.Information);
-
-            // Wait for worker containers to launch.
-            WriteToLog($"Waiting for pods to start...", Verbosity.Information);
-            CancellationTokenSource cts = new CancellationTokenSource(10 * 1000);
-            foreach (string worker in workers)
-                WaitFor(worker, HasStarted, cts);
-
-            // Send input files to pods.
-            // The keys here are the pod names
-            // The values are the pod's input file.
-            // todo: create a struct to hold this?
-            WriteToLog("Sending input files to pods...", Verbosity.Information);
-            foreach (KeyValuePair<string, string> pod in pods)
-            {
-                SendFilesToPod(pod.Key, supportFiles.Append(pod.Value), workerInputsPath);
-                SendStartSignalToPod(pod.Key);
-            }
-
-            // Delete temp files.
-            Directory.Delete(tempDir, true);
-        }
-
-        /// <summary>
-        /// Split an .apsimx file into smaller chunks, of the given size.
-        /// </summary>
-        /// <param name="inputFile">The input .apsimx file.</param>
-        /// <param name="simsPerFile">The number of simulations to add to each generated file.</param>
-        private static IEnumerable<string> SplitApsimXFile(string inputFile, uint simsPerFile, string outputPath)
-        {
-            var files = GenerateApsimXFiles.SplitFile(inputFile, simsPerFile, outputPath, p => Console.Write($"Chunking input file {inputFile}: {(100.0 * p):f2}%\r"), true);
-            Console.WriteLine();
-            return files;
         }
 
         /// <summary>
@@ -1000,6 +920,7 @@ namespace APSIM.Bootstrapper
             V1ObjectMeta metadata = new V1ObjectMeta(name: podName);
             metadata.Labels = new Dictionary<string, string>();
             metadata.Labels[podTypeLabelName] = workerPodType;
+            metadata.Labels[podPortNoLabelName] = portNo.ToString(CultureInfo.InvariantCulture);
 
             V1PodSpec spec = new V1PodSpec()
             {
@@ -1225,7 +1146,7 @@ namespace APSIM.Bootstrapper
                 "-c",
                 // todo: extract port # to user param
                 // todo: use pod's internal IP address rather than 0.0.0.0
-                $"mkdir -p {workerInputsPath} && until [ -f {containerStartFile} ]; do sleep 1; done; echo File upload complete, starting server && /apsim/apsim-server listen -vkrmf {workerInputsPath}/{fileName} -a 0.0.0.0 -p {portNo}"
+                $"mkdir -p {workerInputsPath} && until [ -f {containerStartFile} ]; do sleep 1; done; echo File upload complete, starting server && apsim-server listen -vkrmf {workerInputsPath}/{fileName} -a 0.0.0.0 -p {portNo} --backlog 3"
             };
 
             return new V1Container(
@@ -1233,6 +1154,9 @@ namespace APSIM.Bootstrapper
                 image: imageName,
                 command: new string[] { "/bin/sh" },
                 args: args,
+                // Never set the image policy to "Always" here. We often have a
+                // large number of workers, and setting this to always will
+                // trigger the dockerhub API rate limiting.
                 imagePullPolicy: ifNotPresent,
                 readinessProbe: CreateReadinessProbe(portNo)
             );
@@ -1280,41 +1204,12 @@ namespace APSIM.Bootstrapper
         }
 
         /// <summary>
-        /// Get the state of the given worker pod. Can return null (e.g. if the pod is in the "Pending" phase.)
-        /// </summary>
-        /// <param name="podName">Name of the pod.</param>
-        private V1ContainerState GetPodState(string podName)
-        {
-            V1Pod pod = GetPod(podName);
-            string container = GetContainerName(podName);
-            return pod.Status.ContainerStatuses?.FirstOrDefault(c => c.Name == container)?.State;
-        }
-
-        /// <summary>
         /// Get the worker pod with the given name.
         /// </summary>
         /// <param name="podName">Name of the worker pod.</param>
         private V1Pod GetPod(string podName)
         {
-            try
-            {
-                return client.ReadNamespacedPod(podName, jobNamespace);
-            }
-            catch (System.Net.Http.HttpRequestException)
-            {
-                int numTries = 3;
-                for (uint i = 0; i < numTries; i++)
-                {
-                    try
-                    {
-                        return client.ReadNamespacedPod(podName, jobNamespace);
-                    }
-                    catch
-                    {
-                    }
-                }
-                throw;
-            }
+            return client.ReadNamespacedPod(podName, jobNamespace);
         }
 
         /// <summary>
