@@ -11,7 +11,10 @@ using k8s;
 namespace APSIM.Bootstrapper
 {
     /// <summary>
-    /// This class creates a socket server listening on the
+    /// This class creates a socket server listening on the local machine. It
+    /// forwards all data received from the local client on to the pod, and
+    /// transmits all data received from the pod to the local client. This
+    /// allows for full duplex comms with a pod.
     /// </summary>
     internal class PortForwardingService : IDisposable, IAsyncDisposable
     {
@@ -47,13 +50,12 @@ namespace APSIM.Bootstrapper
         }
 
         /// <summary>
-        /// Initiate port forwarding from localhost to the job manager,
-        /// allowing us to connect to the job manager pod. This is done
-        /// by creating a socket server listening on localhost on a
-        /// randomly selected free port. This socket server allows for
-        /// duplex comms to/from the specified pod. The return value of
-        /// this function is the port number on which the server is
-        /// listening.
+        /// Initiate port forwarding from localhost to the specified pod,
+        /// allowing us to connect to the pod. This is done by creating a socket
+        /// server listening on localhost on a randomly selected free port. This
+        /// socket server allows for duplex comms to/from the specified pod. The
+        /// return value of this function is the port number on which the server
+        /// is listening.
         /// 
         /// The port forwarding service can be stopped either by calling
         /// <see cref="Stop"/> or <see cref="Dispose"/>.
