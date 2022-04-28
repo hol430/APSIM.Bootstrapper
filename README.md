@@ -4,6 +4,8 @@ This is a console application which bootstraps a cloud/cluster run of APSIM. It 
 
 ## Getting Started
 
+Before running the bootstrapper, you need to initialise the nodes in your cluster as required for the job. The bootstrapper will start pods/containers, but these require that nodes already exist in the cluster on which they can be run. See [here](NECTAR.md) for instructions on doing this with the NECTAR research cluster.
+
 To run a debug build of the bootstrapper on a local machine, you will need [kubectl](https://kubernetes.io/docs/tasks/tools/#kubectl) (the kubernetes CLI), [minikube](https://minikube.sigs.k8s.io/docs/start/) (a kubernetes cluster which runs on a local machine) and [docker](https://docs.docker.com/get-docker/) (minikube supports multiple container runtimes, but this tool only supports docker). Once these are in place, you will need to start minikube, and will almost certainly need to start a proxy server to the kubernetes API server as well. Finally, it's also recommended to start the kubernetes dashboard in order to monitor and diagnose any jobs started with the bootstrapper.
 
 ```
@@ -27,3 +29,7 @@ dotnet /path/to/APSIM.Bootstrapper.dll -f /path/to/input/file.apsimx
 ```
 
 Currently this requires code changes for use in a non-minikube kubernetes environment (e.g. a real cluster).
+
+## Notes
+
+The bootstrapper doesn't really do anything useful by itself. It provides the tools needed to setup a cluster environment as needed for a job involving apsim. The bootstrapper should ultimately be a class library, but I'm leaving it as a console application for now, for demonstrative purposes.
