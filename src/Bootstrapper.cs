@@ -298,12 +298,6 @@ namespace APSIM.Bootstrapper
         private Options options;
 
         /// <summary>
-        /// Names of the worker pods. This is used mainly for monitoring
-        /// purposes, to ensure that they launched without error.
-        /// </summary>
-        private IEnumerable<string> workers;
-
-        /// <summary>
         /// Create a new <see cref="Bootstrapper"/> instance.
         /// </summary>
         /// <param name="options"></param>
@@ -473,7 +467,7 @@ namespace APSIM.Bootstrapper
             Action<Exception> errorHandler = e => { if (!conditionMet) throw e; };
 
             // Start monitoring the pod.
-            using (Watcher<V1Pod> watcher = await client.WatchNamespacedPodAsync(podName, jobNamespace, onEvent: onEvent, onError: errorHandler, cancellationToken: cancelToken))
+            using (Watcher<V1Pod> watcher = client.CoreV1.ListNamespacedPodWithHttpMessagesAsync(jobNamespace, fieldSelector: $"metadata.name={podName}", watch: true, cancellationToken: cancelToken).Watch(onEvent: onEvent, onError: errorHandler))
             {
                 // The callback will only be invoked when the pod's state has changed. So we
                 // manually check the condition now, in case the pod has already reached a

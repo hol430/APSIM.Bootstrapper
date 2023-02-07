@@ -9,7 +9,9 @@ using APSIM.Server.Commands;
 using APSIM.Shared.Utilities;
 using CommandLine;
 using Microsoft.Rest;
-using Models.Core.Run;
+using System.Linq;
+
+using Override = Models.Core.Overrides.Override;
 
 namespace APSIM.Bootstrapper
 {
@@ -58,7 +60,7 @@ namespace APSIM.Bootstrapper
                     for (int i = 0; i < 2; i++)
                     {
                         // 2. Run everything.
-                        RunCommand command = new RunCommand(new IReplacement[0]);
+                        RunCommand command = new RunCommand(Enumerable.Empty<Override>());
                         bootstrapper.RunWithChanges(command);
 
                         // 3. Read outputs.
